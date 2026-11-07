@@ -78,9 +78,11 @@ class SharedPingProber:
 
     def __init__(self) -> None:
         self._cache: Dict[str, Tuple[Optional[float], bool, float]] = {}
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
 
     async def probe_ips(self, ips: List[str]) -> Dict[str, Tuple[Optional[float], bool]]:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         now = time.monotonic()
         results: Dict[str, Tuple[Optional[float], bool]] = {}
         to_ping: List[str] = []

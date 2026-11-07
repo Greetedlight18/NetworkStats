@@ -29,21 +29,17 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         self.active_connections: List[WebSocket] = []
-        self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
-        async with self._lock:
-            self.active_connections.append(websocket)
+        self.active_connections.append(websocket)
 
     async def disconnect(self, websocket: WebSocket) -> None:
-        async with self._lock:
-            if websocket in self.active_connections:
-                self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
-        async with self._lock:
-            clients = list(self.active_connections)
+        clients = list(self.active_connections)
         if not clients:
             return
         stale: List[WebSocket] = []
@@ -52,11 +48,9 @@ class ConnectionManager:
                 await ws.send_json(message)
             except Exception:
                 stale.append(ws)
-        if stale:
-            async with self._lock:
-                for ws in stale:
-                    if ws in self.active_connections:
-                        self.active_connections.remove(ws)
+        for ws in stale:
+            if ws in self.active_connections:
+                self.active_connections.remove(ws)
 
 
 ws_manager = ConnectionManager()
