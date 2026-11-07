@@ -1,0 +1,16 @@
+.git
+.gitignore
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv
+venv
+data
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+README.md

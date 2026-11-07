@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  networkstats:
+    build: .
+    image: networkstats:latest
+    container_name: networkstats
+    restart: unless-stopped
+    ports:
+      - "8085:8000"
+    volumes:
+      - /opt/networkstats/data:/data
+    environment:
+      - TZ=America/New_York
+      - DB_PATH=/data/networkstats.db
+      - PROBE_INTERVAL=2.0
+      - RETENTION_HOURS=48
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
