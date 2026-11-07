@@ -133,19 +133,7 @@ def list_targets() -> List[Dict[str, Any]]:
 
             loss_1h = 0.0
             if final_hop:
-                f_hop_num = final_hop["hop_num"]
-                stat_1h = conn.execute(
-                    """
-                    SELECT COUNT(*) as total, SUM(is_loss) as lost_cnt
-                    FROM hop_metrics
-                    WHERE target_id = ? AND hop_num = ? AND timestamp >= ?
-                    """,
-                    (t_id, f_hop_num, one_hour_ago),
-                ).fetchone()
-                if stat_1h and stat_1h["total"] and stat_1h["total"] > 0:
-                    loss_1h = round((stat_1h["lost_cnt"] / stat_1h["total"]) * 100.0, 2)
-                else:
-                    loss_1h = round(float(final_hop["rolling_loss_pct"]), 2)
+                loss_1h = round(float(final_hop["rolling_loss_pct"]), 1)
 
             result.append(
                 {

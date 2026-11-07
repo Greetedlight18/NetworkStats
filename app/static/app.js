@@ -588,6 +588,7 @@ function handleWsMessage(msg) {
       targetObj.avg_ms = msg.summary.avg_ms;
       targetObj.jitter_ms = msg.summary.jitter_ms;
       targetObj.rolling_loss_pct = msg.summary.rolling_loss_pct;
+      targetObj.loss_1h_pct = msg.summary.rolling_loss_pct;
       targetObj.hop_count = msg.summary.hop_count;
     }
     renderTargetList();
