@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import ipaddress
 import json
 import logging
 import math
@@ -9,14 +10,27 @@ import socket
 import time
 from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional, Tuple
 
+from icmplib import async_multiping, async_traceroute
+
 from app import database
 
 logger = logging.getLogger("NetworkStats.monitor")
 
-DEFAULT_INTERVAL = float(os.getenv("PROBE_INTERVAL", "2.0"))
+DEFAULT_INTERVAL = float(os.getenv("PROBE_INTERVAL", "1.0"))
 ROLLING_WINDOW_SIZE = 100
 SPARKLINE_SIZE = 30
 RDNS_TTL_SEC = 1800
+ROUTE_REFRESH_SEC = 90.0
+SHARED_PING_CACHE_TTL = 0.75  # Deduplicate pings to shared hops (e.g. hops 1-3) across targets
+
+
+def _is_docker_bridge_ip(ip_str: str) -> bool:
+    """Return True if IP is inside Docker's default 172.16.0.0/12 bridge range."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return addr in ipaddress.ip_network("172.16.0.0/12")
+    except Exception:
+        return False
 
 
 class RDNSResolver:
@@ -53,6 +67,58 @@ class RDNSResolver:
         finally:
             self._cache[ip] = (hostname, time.time() + RDNS_TTL_SEC)
             self._in_flight.discard(ip)
+
+
+class SharedPingProber:
+    """
+    Deduplicates ICMP Echo probes across all monitored targets so shared local hops
+    (Hops 1, 2, 3 - home router & ISP modem) are only pinged once per second instead
+    of being blasted by N concurrent traceroutes (which triggers ICMP rate-limiting).
+    """
+
+    def __init__(self) -> None:
+        self._cache: Dict[str, Tuple[Optional[float], bool, float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def probe_ips(self, ips: List[str]) -> Dict[str, Tuple[Optional[float], bool]]:
+        now = time.monotonic()
+        results: Dict[str, Tuple[Optional[float], bool]] = {}
+        to_ping: List[str] = []
+
+        async with self._lock:
+            for ip in ips:
+                if not ip or ip == "???":
+                    continue
+                cached = self._cache.get(ip)
+                if cached and cached[2] > now:
+                    results[ip] = (cached[0], cached[1])
+                elif ip not in to_ping:
+                    to_ping.append(ip)
+
+            if to_ping:
+                try:
+                    responses = await async_multiping(
+                        to_ping,
+                        count=1,
+                        interval=0.015,
+                        timeout=0.8,
+                        privileged=True,
+                    )
+                    resp_time = time.monotonic()
+                    for r in responses:
+                        if r.is_alive and r.avg_rtt is not None:
+                            ms = round(float(r.avg_rtt), 2)
+                            self._cache[r.address] = (ms, False, resp_time + SHARED_PING_CACHE_TTL)
+                            results[r.address] = (ms, False)
+                        else:
+                            self._cache[r.address] = (None, True, resp_time + SHARED_PING_CACHE_TTL)
+                            results[r.address] = (None, True)
+                except Exception as exc:
+                    logger.error("Error in async_multiping: %s", exc)
+                    for ip in to_ping:
+                        results[ip] = (None, True)
+
+        return results
 
 
 class HopStatsAccumulator:
@@ -102,11 +168,27 @@ class HopStatsAccumulator:
         latency_ms: Optional[float],
         is_loss: bool,
     ) -> None:
-        if ip_address and ip_address != "???":
-            self.ip_address = ip_address
-            self.rdns_hostname = rdns_hostname
-        elif self.ip_address == "???":
-            self.rdns_hostname = "???"
+        # If the hop IP changed (e.g. route cleaned up), reset stats for this hop slot
+        if (
+            ip_address != self.ip_address
+            and self.ip_address != "???"
+            and ip_address != "???"
+        ):
+            self.sent = 0
+            self.lost = 0
+            self.min_ms = None
+            self.max_ms = None
+            self.avg_ms = None
+            self.rolling_outcomes.clear()
+            self.rolling_latencies.clear()
+            self.sparkline.clear()
+
+        self.ip_address = ip_address
+        self.rdns_hostname = rdns_hostname if ip_address != "???" else "???"
+
+        if ip_address == "???":
+            self.last_ms = None
+            return
 
         self.sent += 1
         if is_loss or latency_ms is None:
@@ -130,13 +212,11 @@ class HopStatsAccumulator:
             if self.avg_ms is None or responded <= 1:
                 self.avg_ms = ms
             else:
-                # Incremental mean update blended with rolling window
                 self.avg_ms = round(
                     self.avg_ms + ((ms - self.avg_ms) / min(responded, ROLLING_WINDOW_SIZE)),
                     2,
                 )
 
-        # Standard deviation (Jitter) over rolling window
         if len(self.rolling_latencies) >= 2:
             mean_val = sum(self.rolling_latencies) / len(self.rolling_latencies)
             variance = sum((x - mean_val) ** 2 for x in self.rolling_latencies) / len(
@@ -178,7 +258,7 @@ class HopStatsAccumulator:
 
 
 class MonitorEngine:
-    """Manages per-target async MTR workers and broadcasts real-time updates."""
+    """Manages per-target async MTR route discovery + deduplicated ICMP hop probing."""
 
     def __init__(
         self,
@@ -189,17 +269,15 @@ class MonitorEngine:
         self._prune_task: Optional[asyncio.Task] = None
         self._running = False
         self._rdns = RDNSResolver()
+        self._prober = SharedPingProber()
         self._mtr_bin = shutil.which("mtr")
         self._hop_accumulators: Dict[int, Dict[int, HopStatsAccumulator]] = {}
         self._route_cache: Dict[str, Tuple[List[str], float]] = {}
+        self._route_locks: Dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         self._running = True
-        if self._mtr_bin:
-            logger.info("MTR Engine initialized using binary: %s", self._mtr_bin)
-        else:
-            logger.warning("mtr binary not found in PATH; falling back to icmplib engine")
-
+        logger.info("MonitorEngine started (mtr=%s)", self._mtr_bin or "icmplib")
         await self.sync_workers()
         self._prune_task = asyncio.create_task(self._prune_loop())
 
@@ -213,33 +291,40 @@ class MonitorEngine:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._tasks.clear()
 
-    async def sync_workers(self) -> None:
+    async def sync_workers(self, restart_target_id: Optional[int] = None) -> None:
         """Synchronize running tasks with active targets in the SQLite database."""
         targets = database.list_targets()
         active_ids = {t["id"] for t in targets if t["enabled"]}
 
-        # Cancel removed or paused targets
+        if restart_target_id is not None and restart_target_id in self._tasks:
+            self._tasks[restart_target_id].cancel()
+            del self._tasks[restart_target_id]
+
         for t_id in list(self._tasks.keys()):
             if t_id not in active_ids:
                 self._tasks[t_id].cancel()
                 del self._tasks[t_id]
                 logger.info("Stopped monitoring worker for target_id=%d", t_id)
 
-        # Start new or resumed targets
         for t in targets:
             t_id = t["id"]
             if t["enabled"] and t_id not in self._tasks:
-                self._load_existing_accumulators(t_id)
+                if t_id not in self._hop_accumulators:
+                    self._load_existing_accumulators(t_id)
                 self._tasks[t_id] = asyncio.create_task(self._target_loop(t_id))
                 logger.info(
-                    "Started monitoring worker for target_id=%d (%s - %s)",
+                    "Started monitoring worker for target_id=%d (%s - %s, %.1fs)",
                     t_id,
                     t["label"],
                     t["host"],
+                    t["interval_sec"],
                 )
 
     def reset_target_memory(self, target_id: int) -> None:
         self._hop_accumulators.pop(target_id, None)
+        target = database.get_target(target_id)
+        if target:
+            self._route_cache.pop(target["host"], None)
 
     def _load_existing_accumulators(self, target_id: int) -> None:
         existing_hops = database.get_hop_states(target_id)
@@ -263,7 +348,7 @@ class MonitorEngine:
     async def _prune_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(1800)  # Prune every 30 minutes
+                await asyncio.sleep(1800)
                 database.prune_old_metrics()
             except asyncio.CancelledError:
                 break
@@ -287,7 +372,6 @@ class MonitorEngine:
                     acc_map = self._hop_accumulators.setdefault(target_id, {})
 
                     max_hop = max(h["hop_num"] for h in raw_hops)
-                    # Trim stale hops beyond current route length
                     for old_hop in list(acc_map.keys()):
                         if old_hop > max_hop:
                             del acc_map[old_hop]
@@ -301,6 +385,8 @@ class MonitorEngine:
                         is_loss = h["is_loss"]
                         latency_ms = h["latency_ms"]
                         rdns = self._rdns.get_cached(ip_addr)
+                        if hop_num == max_hop and rdns == ip_addr and host != ip_addr:
+                            rdns = host
 
                         acc = acc_map.get(hop_num)
                         if not acc:
@@ -358,137 +444,131 @@ class MonitorEngine:
                 logger.error("Probe error for target %s (%d): %s", host, target_id, exc)
 
             elapsed = time.monotonic() - cycle_start
-            sleep_for = max(0.25, interval - elapsed)
+            sleep_for = max(0.05, interval - elapsed)
             try:
                 await asyncio.sleep(sleep_for)
             except asyncio.CancelledError:
                 break
 
-    async def _probe_route(self, host: str) -> List[Dict[str, Any]]:
-        """Run non-blocking MTR JSON cycle, falling back to icmplib if needed."""
-        if self._mtr_bin:
-            hops = await self._probe_with_mtr(host)
-            if hops:
-                return hops
-        return await self._probe_with_icmplib(host)
-
-    async def _probe_with_mtr(self, host: str) -> List[Dict[str, Any]]:
-        cmd = [
-            self._mtr_bin,
-            "--report",
-            "--report-cycles",
-            "1",
-            "--interval",
-            "0.2",
-            "--gracetime",
-            "1",
-            "--no-dns",
-            "--json",
-            host,
-        ]
+    async def _resolve_host_ip(self, host: str) -> str:
+        loop = asyncio.get_running_loop()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            res = await asyncio.wait_for(
+                loop.run_in_executor(None, socket.gethostbyname, host),
+                timeout=2.0,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
-            if not stdout:
-                return []
+            return res or host
+        except Exception:
+            return host
 
-            payload = json.loads(stdout.decode("utf-8", errors="ignore"))
-            hubs = payload.get("report", {}).get("hubs", [])
-            if not hubs:
-                return []
+    async def _get_clean_route_ips(self, host: str) -> List[str]:
+        """
+        Discover the hop IP list to `host` and sanitize it:
+        1. Remove Docker's internal 172.16.0.0/12 bridge hop if it's Hop #1.
+        2. Strip dead/unresponsive ('???') hops so AWS/Epic Games firewalls
+           don't clutter the table with 10+ dead rows.
+        3. Always ensure the final hop is the resolved destination IP.
+        """
+        now = time.monotonic()
+        cached = self._route_cache.get(host)
+        if cached and cached[1] > now:
+            return cached[0]
 
-            results: List[Dict[str, Any]] = []
-            for idx, hub in enumerate(hubs):
-                hop_num = int(hub.get("count", idx + 1))
-                ip_addr = str(hub.get("host", "???")).strip() or "???"
-                loss_val = float(hub.get("Loss%", 0.0))
-                last_val = float(hub.get("Last", 0.0))
-                is_loss = ip_addr == "???" or loss_val >= 100.0
-                latency = None if is_loss else round(last_val, 2)
-                results.append(
-                    {
-                        "hop_num": hop_num,
-                        "ip_address": ip_addr,
-                        "latency_ms": latency,
-                        "is_loss": is_loss,
-                    }
+        # If we already have a cached route, refresh in background so we never pause 1s pings
+        if cached:
+            asyncio.create_task(self._refresh_route_bg(host))
+            return cached[0]
+
+        return await self._discover_route(host)
+
+    async def _refresh_route_bg(self, host: str) -> None:
+        lock = self._route_locks.setdefault(host, asyncio.Lock())
+        if lock.locked():
+            return
+        async with lock:
+            await self._discover_route(host)
+
+    async def _discover_route(self, host: str) -> List[str]:
+        dest_ip = await self._resolve_host_ip(host)
+        raw_ips: List[str] = []
+
+        if self._mtr_bin:
+            cmd = [
+                self._mtr_bin,
+                "--report",
+                "--report-cycles",
+                "1",
+                "--interval",
+                "0.05",
+                "--gracetime",
+                "0.5",
+                "--max-ttl",
+                "24",
+                "--no-dns",
+                "--json",
+                dest_ip,
+            ]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-            return results
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.debug("mtr execution fallback for %s: %s", host, exc)
-            return []
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=6.0)
+                if stdout:
+                    payload = json.loads(stdout.decode("utf-8", errors="ignore"))
+                    hubs = payload.get("report", {}).get("hubs", [])
+                    for hub in hubs:
+                        ip_addr = str(hub.get("host", "???")).strip() or "???"
+                        raw_ips.append(ip_addr)
+            except Exception as exc:
+                logger.debug("mtr route discovery error for %s: %s", host, exc)
 
-    async def _probe_with_icmplib(self, host: str) -> List[Dict[str, Any]]:
-        """Fallback concurrent ICMP hop prober using icmplib or system ping."""
-        try:
-            from icmplib import async_multiping, async_traceroute
+        if not raw_ips:
+            try:
+                hops = await async_traceroute(dest_ip, count=1, timeout=0.8, max_hops=24)
+                raw_ips = [h.address for h in hops if h.address]
+            except Exception as exc:
+                logger.debug("icmplib route discovery error for %s: %s", host, exc)
 
-            now = time.time()
-            cached_route = self._route_cache.get(host)
-            if not cached_route or cached_route[1] < now:
-                hops = await async_traceroute(host, count=1, timeout=1.0, max_hops=24)
-                hop_ips: List[str] = []
-                last_distance = 0
-                for h in hops:
-                    while last_distance + 1 < h.distance:
-                        hop_ips.append("???")
-                        last_distance += 1
-                    hop_ips.append(h.address)
-                    last_distance = h.distance
-                if not hop_ips:
-                    hop_ips = [host]
-                self._route_cache[host] = (hop_ips, now + 120.0)
+        # Filter out '???' hops and Docker bridge hop #1 (172.16.0.0/12)
+        clean_ips: List[str] = []
+        for idx, ip in enumerate(raw_ips):
+            if ip == "???":
+                continue
+            if idx == 0 and _is_docker_bridge_ip(ip) and dest_ip != ip:
+                continue
+            if not clean_ips or clean_ips[-1] != ip:
+                clean_ips.append(ip)
+
+        # Always guarantee the destination IP is the final hop
+        if not clean_ips or clean_ips[-1] != dest_ip:
+            if dest_ip in clean_ips:
+                clean_ips = clean_ips[: clean_ips.index(dest_ip) + 1]
             else:
-                hop_ips = cached_route[0]
+                clean_ips.append(dest_ip)
 
-            valid_ips = [ip for ip in hop_ips if ip != "???"]
-            ping_map = {}
-            if valid_ips:
-                responses = await async_multiping(valid_ips, count=1, timeout=1.0)
-                for r in responses:
-                    ping_map[r.address] = r
+        self._route_cache[host] = (clean_ips, time.monotonic() + ROUTE_REFRESH_SEC)
+        return clean_ips
 
-            results: List[Dict[str, Any]] = []
-            for idx, ip in enumerate(hop_ips):
-                hop_num = idx + 1
-                if ip == "???":
-                    results.append(
-                        {
-                            "hop_num": hop_num,
-                            "ip_address": "???",
-                            "latency_ms": None,
-                            "is_loss": True,
-                        }
-                    )
-                else:
-                    r = ping_map.get(ip)
-                    if r and r.is_alive:
-                        results.append(
-                            {
-                                "hop_num": hop_num,
-                                "ip_address": ip,
-                                "latency_ms": round(float(r.avg_rtt), 2),
-                                "is_loss": False,
-                            }
-                        )
-                    else:
-                        results.append(
-                            {
-                                "hop_num": hop_num,
-                                "ip_address": ip,
-                                "latency_ms": None,
-                                "is_loss": True,
-                            }
-                        )
-            return results
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("icmplib fallback failed for %s: %s", host, exc)
+    async def _probe_route(self, host: str) -> List[Dict[str, Any]]:
+        """Probe all discovered hops along the route using deduplicated ICMP Echo."""
+        hop_ips = await self._get_clean_route_ips(host)
+        if not hop_ips:
             return []
+
+        ping_results = await self._prober.probe_ips(hop_ips)
+        results: List[Dict[str, Any]] = []
+
+        for idx, ip in enumerate(hop_ips):
+            hop_num = idx + 1
+            latency_ms, is_loss = ping_results.get(ip, (None, True))
+            results.append(
+                {
+                    "hop_num": hop_num,
+                    "ip_address": ip,
+                    "latency_ms": latency_ms,
+                    "is_loss": is_loss,
+                }
+            )
+        return results

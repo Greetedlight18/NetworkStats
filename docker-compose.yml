@@ -13,7 +13,7 @@ services:
     environment:
       - TZ=America/New_York
       - DB_PATH=/data/networkstats.db
-      - PROBE_INTERVAL=2.0
+      - PROBE_INTERVAL=1.0
       - RETENTION_HOURS=48
     cap_add:
       - NET_RAW

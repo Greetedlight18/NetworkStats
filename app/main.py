@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,13 +35,11 @@ class ConnectionManager:
         await websocket.accept()
         async with self._lock:
             self.active_connections.append(websocket)
-        logger.info("WebSocket client connected (%d active)", len(self.active_connections))
 
     async def disconnect(self, websocket: WebSocket) -> None:
         async with self._lock:
             if websocket in self.active_connections:
                 self.active_connections.remove(websocket)
-        logger.info("WebSocket client disconnected (%d active)", len(self.active_connections))
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         async with self._lock:
@@ -68,7 +65,7 @@ monitor_engine = MonitorEngine(broadcast_cb=ws_manager.broadcast)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting NetworkStats 24/7 MTR & Visual Traceroute Server...")
+    logger.info("Starting NetworkStats Server...")
     database.init_db()
     database.prune_old_metrics()
     await monitor_engine.start()
@@ -80,7 +77,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NetworkStats",
     description="Self-Hosted 24/7 Network Monitoring and Visual Traceroute Web Application",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -98,12 +95,12 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 class TargetCreateRequest(BaseModel):
     host: str = Field(..., min_length=1, max_length=253, description="IP address or hostname")
     label: Optional[str] = Field(default="", max_length=120, description="Display label")
-    interval_sec: float = Field(default=2.0, ge=1.0, le=60.0, description="Probe interval in seconds")
+    interval_sec: float = Field(default=1.0, ge=0.5, le=60.0, description="Probe interval in seconds")
 
 
 class TargetUpdateRequest(BaseModel):
     label: Optional[str] = Field(default=None, max_length=120)
-    interval_sec: Optional[float] = Field(default=None, ge=1.0, le=60.0)
+    interval_sec: Optional[float] = Field(default=None, ge=0.5, le=60.0)
     enabled: Optional[bool] = Field(default=None)
 
 
@@ -156,7 +153,9 @@ async def api_update_target(target_id: int, req: TargetUpdateRequest):
     if not updated:
         raise HTTPException(status_code=404, detail="Target not found.")
 
-    await monitor_engine.sync_workers()
+    await monitor_engine.sync_workers(
+        restart_target_id=target_id if req.interval_sec is not None else None
+    )
     targets = database.list_targets()
     await ws_manager.broadcast({"type": "targets_changed", "targets": targets})
     return {"target": updated, "targets": targets}

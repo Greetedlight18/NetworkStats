@@ -1,26 +1,26 @@
 /**
- * NetworkStats — Real-Time PingPlotter-Style WebUI Controller
+ * NetworkStats — Clean Real-Time UI Controller
  */
 
 const HOP_PALETTE = [
-  '#22d3ee', // cyan-400
-  '#a855f7', // purple-500
-  '#38bdf8', // sky-400
-  '#f59e0b', // amber-500
-  '#10b981', // emerald-500
-  '#ec4899', // pink-500
-  '#6366f1', // indigo-500
-  '#84cc16', // lime-500
-  '#14b8a6', // teal-500
-  '#f97316', // orange-500
+  '#22d3ee',
+  '#a855f7',
+  '#38bdf8',
+  '#f59e0b',
+  '#10b981',
+  '#ec4899',
+  '#6366f1',
+  '#84cc16',
+  '#14b8a6',
+  '#f97316',
 ];
 
 const state = {
   targets: [],
   selectedTargetId: null,
   hopsByTarget: {},
-  plottedHopsByTarget: {}, // targetId -> Set of hop_num
-  historySeries: {},       // hop_num -> Array of { ts, ms, loss }
+  plottedHopsByTarget: {},
+  historySeries: {},
   windowSeconds: 300,
   ws: null,
   wsPingTimer: null,
@@ -34,7 +34,7 @@ const elHopTableBody = document.getElementById('hopTableBody');
 const elActiveBadge = document.getElementById('activeTargetBadge');
 const elActiveLabel = document.getElementById('activeTargetLabel');
 const elActiveHost = document.getElementById('activeTargetHost');
-const elActiveInterval = document.getElementById('activeTargetInterval');
+const elSelectInterval = document.getElementById('selectTargetInterval');
 const elHeaderPing = document.getElementById('headerPingVal');
 const elHeaderJitter = document.getElementById('headerJitterVal');
 const elHeaderLoss = document.getElementById('headerLossVal');
@@ -43,8 +43,6 @@ const elBtnTogglePauseText = document.getElementById('btnTogglePauseText');
 const elBtnResetStats = document.getElementById('btnResetStats');
 const elBtnDeleteTarget = document.getElementById('btnDeleteTarget');
 const elPlottedSummary = document.getElementById('plottedHopsSummary');
-const elWsDot = document.getElementById('wsStatusDot');
-const elWsText = document.getElementById('wsStatusText');
 
 // Modal Elements
 const elAddModal = document.getElementById('addTargetModal');
@@ -58,23 +56,23 @@ function colorForHop(hopNum, isFinal) {
 
 function getTargetStatus(target) {
   if (!target.enabled) {
-    return { color: 'bg-slate-500', text: 'Paused', badgeClass: 'text-slate-400 bg-slate-800 border-slate-700' };
+    return { color: 'bg-slate-600' };
   }
   const loss = Math.max(Number(target.rolling_loss_pct || 0), Number(target.loss_1h_pct || 0));
   const ping = target.current_ms;
   const jitter = Number(target.jitter_ms || 0);
 
   if (loss >= 5.0 || (target.hop_count > 0 && ping === null && loss > 0)) {
-    return { color: 'bg-rose-500', text: 'Packet Loss', badgeClass: 'text-rose-300 bg-rose-950/70 border-rose-800' };
+    return { color: 'bg-rose-500' };
   }
   if (loss >= 1.0 || (ping !== null && ping > 120) || jitter > 25) {
-    return { color: 'bg-amber-400', text: 'Degraded', badgeClass: 'text-amber-300 bg-amber-950/70 border-amber-800' };
+    return { color: 'bg-amber-400' };
   }
-  return { color: 'bg-emerald-400', text: 'Healthy', badgeClass: 'text-emerald-300 bg-emerald-950/70 border-emerald-800' };
+  return { color: 'bg-emerald-400' };
 }
 
 function formatMs(val) {
-  if (val === null || val === undefined || Number.isNaN(Number(val))) return '---';
+  if (val === null || val === undefined || Number.isNaN(Number(val))) return '--';
   return `${Number(val).toFixed(1)} ms`;
 }
 
@@ -87,65 +85,52 @@ function formatTimeLabel(unixSec, windowSec) {
 }
 
 // ============================================================================
-// Chart.js Real-Time Timeline Initialization & Updates
+// Chart.js Timeline
 // ============================================================================
 function initTimelineChart() {
   const ctx = document.getElementById('timelineChart').getContext('2d');
   state.chart = new Chart(ctx, {
     type: 'line',
-    data: {
-      labels: [],
-      datasets: [],
-    },
+    data: { labels: [], datasets: [] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      interaction: {
-        mode: 'index',
-        intersect: false,
-      },
+      interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: {
           display: true,
           position: 'top',
           align: 'end',
           labels: {
-            color: '#cbd5e1',
-            boxWidth: 12,
-            boxHeight: 12,
+            color: '#94a3b8',
+            boxWidth: 10,
+            boxHeight: 10,
             font: { family: 'ui-monospace, monospace', size: 11 },
           },
         },
         tooltip: {
-          backgroundColor: 'rgba(15, 23, 42, 0.95)',
+          backgroundColor: 'rgba(12, 18, 30, 0.95)',
           titleColor: '#f8fafc',
-          bodyColor: '#e2e8f0',
-          borderColor: '#334155',
+          bodyColor: '#cbd5e1',
+          borderColor: '#1e293b',
           borderWidth: 1,
           titleFont: { family: 'ui-monospace, monospace', size: 11 },
           bodyFont: { family: 'ui-monospace, monospace', size: 11 },
         },
         zoom: {
-          pan: {
-            enabled: true,
-            mode: 'x',
-          },
-          zoom: {
-            wheel: { enabled: true },
-            pinch: { enabled: true },
-            mode: 'x',
-          },
+          pan: { enabled: true, mode: 'x' },
+          zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
         },
       },
       scales: {
         x: {
-          grid: { color: 'rgba(51, 65, 85, 0.25)' },
+          grid: { color: 'rgba(30, 41, 59, 0.4)' },
           ticks: {
-            color: '#94a3b8',
+            color: '#64748b',
             maxRotation: 0,
             autoSkip: true,
-            maxTicksLimit: 10,
+            maxTicksLimit: 9,
             font: { family: 'ui-monospace, monospace', size: 10 },
           },
         },
@@ -153,16 +138,11 @@ function initTimelineChart() {
           type: 'linear',
           position: 'left',
           beginAtZero: true,
-          suggestedMax: 50,
-          grid: { color: 'rgba(51, 65, 85, 0.35)' },
-          title: {
-            display: true,
-            text: 'Latency (ms)',
-            color: '#94a3b8',
-            font: { family: 'ui-monospace, monospace', size: 11 },
-          },
+          suggestedMax: 40,
+          grid: { color: 'rgba(30, 41, 59, 0.5)' },
           ticks: {
-            color: '#cbd5e1',
+            color: '#94a3b8',
+            callback: (v) => `${v} ms`,
             font: { family: 'ui-monospace, monospace', size: 10 },
           },
         },
@@ -172,14 +152,8 @@ function initTimelineChart() {
           min: 0,
           max: 100,
           grid: { drawOnChartArea: false },
-          title: {
-            display: true,
-            text: 'Packet Loss (%)',
-            color: '#fb7185',
-            font: { family: 'ui-monospace, monospace', size: 11 },
-          },
           ticks: {
-            color: '#fb7185',
+            color: '#f43f5e',
             callback: (v) => `${v}%`,
             font: { family: 'ui-monospace, monospace', size: 10 },
           },
@@ -194,8 +168,16 @@ function getPlottedSet(targetId, hops) {
     state.plottedHopsByTarget[targetId] = new Set();
   }
   const set = state.plottedHopsByTarget[targetId];
-  if (set.size === 0 && hops && hops.length > 0) {
-    set.add(hops[hops.length - 1].hop_num);
+  if (hops && hops.length > 0) {
+    const validNums = new Set(hops.map((h) => h.hop_num));
+    for (const hNum of Array.from(set)) {
+      if (!validNums.has(hNum)) {
+        set.delete(hNum);
+      }
+    }
+    if (set.size === 0) {
+      set.add(hops[hops.length - 1].hop_num);
+    }
   }
   return set;
 }
@@ -208,17 +190,12 @@ function renderTimelineChart() {
   const plottedSet = getPlottedSet(state.selectedTargetId, hops);
   const plottedHops = Array.from(plottedSet).sort((a, b) => a - b);
 
-  if (plottedHops.length === 0) {
-    elPlottedSummary.textContent = '(No hops selected)';
-  } else {
-    elPlottedSummary.textContent = `(Plotting Hop ${plottedHops.map((h) => `#${h}`).join(', ')})`;
-  }
+  elPlottedSummary.textContent =
+    plottedHops.length > 0 ? `Hop ${plottedHops.map((h) => `#${h}`).join(', ')}` : '';
 
-  // Collect unified sorted timestamps across plotted hops
   const tsSet = new Set();
   for (const hNum of plottedHops) {
-    const arr = state.historySeries[String(hNum)] || [];
-    for (const pt of arr) {
+    for (const pt of state.historySeries[String(hNum)] || []) {
       tsSet.add(pt.ts);
     }
   }
@@ -230,12 +207,9 @@ function renderTimelineChart() {
     ? finalHopNum
     : plottedHops[plottedHops.length - 1];
 
-  // Add Latency Line Dataset for each toggled hop
   for (const hNum of plottedHops) {
     const hopMeta = hops.find((h) => h.hop_num === hNum);
-    const hopLabel = hopMeta
-      ? `Hop #${hNum} (${hopMeta.ip_address})`
-      : `Hop #${hNum}`;
+    const hopLabel = hopMeta ? `#${hNum} ${hopMeta.ip_address}` : `#${hNum}`;
     const color = colorForHop(hNum, hNum === finalHopNum);
 
     const ptMap = new Map();
@@ -243,46 +217,40 @@ function renderTimelineChart() {
       ptMap.set(pt.ts, pt);
     }
 
-    const latencyData = sortedTs.map((ts) => {
-      const item = ptMap.get(ts);
-      return item && item.ms !== null ? item.ms : null;
-    });
-
     datasets.push({
       type: 'line',
-      label: `${hopLabel} Latency`,
-      data: latencyData,
+      label: hopLabel,
+      data: sortedTs.map((ts) => {
+        const item = ptMap.get(ts);
+        return item && item.ms !== null ? item.ms : null;
+      }),
       borderColor: color,
-      backgroundColor: hNum === primaryHop ? 'rgba(34, 211, 238, 0.12)' : 'transparent',
+      backgroundColor: hNum === primaryHop ? 'rgba(34, 211, 238, 0.08)' : 'transparent',
       fill: hNum === primaryHop,
-      borderWidth: hNum === primaryHop ? 2 : 1.5,
+      borderWidth: 1.75,
       pointRadius: 0,
-      pointHoverRadius: 4,
+      pointHoverRadius: 3,
       spanGaps: true,
-      tension: 0.2,
+      tension: 0.15,
       yAxisID: 'yLatency',
       order: 2,
     });
   }
 
-  // Add Packet Loss Vertical Red Spikes/Bars for the primary plotted hop
   if (primaryHop !== undefined) {
     const ptMap = new Map();
     for (const pt of state.historySeries[String(primaryHop)] || []) {
       ptMap.set(pt.ts, pt);
     }
-    const lossData = sortedTs.map((ts) => {
-      const item = ptMap.get(ts);
-      return item && item.loss > 0 ? item.loss : 0;
-    });
-
     datasets.push({
       type: 'bar',
-      label: `Hop #${primaryHop} Packet Loss %`,
-      data: lossData,
-      backgroundColor: 'rgba(244, 63, 94, 0.75)',
-      borderColor: '#f43f5e',
-      borderWidth: 1,
+      label: 'Loss %',
+      data: sortedTs.map((ts) => {
+        const item = ptMap.get(ts);
+        return item && item.loss > 0 ? item.loss : 0;
+      }),
+      backgroundColor: 'rgba(244, 63, 94, 0.7)',
+      borderWidth: 0,
       barPercentage: 0.9,
       categoryPercentage: 0.95,
       yAxisID: 'yLoss',
@@ -296,7 +264,7 @@ function renderTimelineChart() {
 }
 
 // ============================================================================
-// Sidebar & Hop Table Rendering
+// Sidebar & Hop Table
 // ============================================================================
 function renderTargetList() {
   elTargetCount.textContent = String(state.targets.length);
@@ -305,35 +273,31 @@ function renderTargetList() {
   for (const t of state.targets) {
     const isSelected = t.id === state.selectedTargetId;
     const status = getTargetStatus(t);
-    const pingText = t.current_ms !== null && t.current_ms !== undefined
-      ? `${Number(t.current_ms).toFixed(1)} ms`
-      : '---';
+    const pingText =
+      t.current_ms !== null && t.current_ms !== undefined
+        ? `${Number(t.current_ms).toFixed(1)} ms`
+        : '--';
     const loss1h = Number(t.loss_1h_pct || 0).toFixed(1);
 
     const item = document.createElement('div');
-    item.className = `p-3 cursor-pointer transition border-l-4 ${
+    item.className = `px-3 py-2.5 cursor-pointer transition border-l-2 ${
       isSelected
         ? 'bg-slate-850 border-cyan-400'
-        : 'border-transparent hover:bg-slate-900/80'
+        : 'border-transparent hover:bg-slate-900/60'
     }`;
     item.onclick = () => selectTarget(t.id);
 
     item.innerHTML = `
-      <div class="flex items-center justify-between mb-1">
+      <div class="flex items-center justify-between">
         <div class="flex items-center space-x-2 min-w-0">
-          <span class="w-2.5 h-2.5 rounded-full ${status.color} shrink-0"></span>
-          <span class="font-semibold text-xs text-white truncate">${escapeHtml(t.label)}</span>
+          <span class="w-2 h-2 rounded-full ${status.color} shrink-0"></span>
+          <span class="font-medium text-xs text-slate-100 truncate">${escapeHtml(t.label)}</span>
         </div>
-        <span class="text-[10px] font-mono px-1.5 py-0.5 rounded border ${status.badgeClass}">
-          ${status.text}
-        </span>
+        <span class="text-xs font-mono text-slate-200">${pingText}</span>
       </div>
-      <div class="flex items-center justify-between text-[11px] font-mono text-slate-400 mt-1.5">
-        <span class="text-cyan-400/90 truncate">${escapeHtml(t.host)}</span>
-        <div class="flex items-center space-x-2 shrink-0">
-          <span class="text-slate-200">${pingText}</span>
-          <span class="${Number(loss1h) >= 1 ? 'text-rose-400 font-semibold' : 'text-slate-400'}">${loss1h}% (1h)</span>
-        </div>
+      <div class="flex items-center justify-between text-[11px] font-mono text-slate-500 mt-0.5 pl-4">
+        <span class="truncate">${escapeHtml(t.host)}</span>
+        <span class="${Number(loss1h) >= 1 ? 'text-rose-400' : 'text-slate-500'}">${loss1h}%</span>
       </div>
     `;
     elTargetList.appendChild(item);
@@ -354,24 +318,35 @@ function updateSelectedTargetHeader() {
   }
 
   const status = getTargetStatus(target);
-  elActiveBadge.className = `w-2.5 h-2.5 rounded-full ${status.color} shrink-0`;
+  elActiveBadge.className = `w-2 h-2 rounded-full ${status.color} shrink-0`;
   elActiveLabel.textContent = target.label;
-  elActiveHost.textContent = `(${target.host})`;
-  elActiveInterval.textContent = `${Number(target.interval_sec).toFixed(1)}s interval`;
+  elActiveHost.textContent = target.host !== target.label ? target.host : '';
+
+  // Sync interval selector dropdown
+  const intervalVal = String(Number(target.interval_sec));
+  if ([...elSelectInterval.options].some((o) => o.value === intervalVal)) {
+    elSelectInterval.value = intervalVal;
+  } else {
+    const opt = document.createElement('option');
+    opt.value = intervalVal;
+    opt.textContent = `${Number(target.interval_sec).toFixed(1)}s`;
+    opt.className = 'bg-slate-900 text-slate-200';
+    elSelectInterval.appendChild(opt);
+    elSelectInterval.value = intervalVal;
+  }
 
   elHeaderPing.textContent = formatMs(target.current_ms);
   elHeaderJitter.textContent = formatMs(target.jitter_ms);
   elHeaderLoss.textContent = `${Number(target.loss_1h_pct || 0).toFixed(1)}%`;
-
   elBtnTogglePauseText.textContent = target.enabled ? 'Pause' : 'Resume';
 }
 
 function buildSparklineSvg(sparkline, scaleMaxMs) {
   if (!sparkline || sparkline.length === 0) {
-    return `<div class="text-[10px] text-slate-600">Waiting for probes...</div>`;
+    return `<div class="text-[11px] text-slate-600">...</div>`;
   }
-  const width = 120;
-  const height = 22;
+  const width = 110;
+  const height = 20;
   const maxSamples = 30;
   const step = width / maxSamples;
   const points = [];
@@ -381,7 +356,7 @@ function buildSparklineSvg(sparkline, scaleMaxMs) {
     const x = Math.round(idx * step + step / 2);
     if (val === null || val === undefined) {
       lossBars.push(
-        `<rect x="${x - 1.5}" y="2" width="3" height="${height - 4}" fill="#f43f5e" opacity="0.85" rx="1" />`
+        `<rect x="${x - 1}" y="2" width="2.5" height="${height - 4}" fill="#f43f5e" opacity="0.85" />`
       );
     } else {
       const clamped = Math.min(1, Math.max(0.06, Number(val) / Math.max(10, scaleMaxMs)));
@@ -390,12 +365,13 @@ function buildSparklineSvg(sparkline, scaleMaxMs) {
     }
   });
 
-  const polyline = points.length >= 2
-    ? `<polyline fill="none" stroke="#22d3ee" stroke-width="1.5" points="${points.join(' ')}" />`
-    : '';
+  const polyline =
+    points.length >= 2
+      ? `<polyline fill="none" stroke="#22d3ee" stroke-width="1.4" points="${points.join(' ')}" />`
+      : '';
 
   return `
-    <svg width="${width}" height="${height}" class="overflow-visible shrink-0 bg-slate-900/90 rounded border border-slate-800">
+    <svg width="${width}" height="${height}" class="overflow-visible shrink-0">
       ${lossBars.join('')}
       ${polyline}
     </svg>
@@ -404,29 +380,21 @@ function buildSparklineSvg(sparkline, scaleMaxMs) {
 
 function buildLatencyRangeBar(hop, scaleMaxMs) {
   if (hop.min_ms === null || hop.max_ms === null) {
-    return `<div class="flex-1 h-2.5 bg-slate-900 rounded border border-slate-800/80"></div>`;
+    return `<div class="flex-1 h-2 bg-slate-900 rounded"></div>`;
   }
   const ceil = Math.max(20, scaleMaxMs);
-  const minPct = Math.min(96, Math.max(0, (hop.min_ms / ceil) * 100));
+  const minPct = Math.min(95, Math.max(0, (hop.min_ms / ceil) * 100));
   const maxPct = Math.min(100, Math.max(minPct + 2, (hop.max_ms / ceil) * 100));
-  const avgPct = hop.avg_ms !== null ? Math.min(98, Math.max(0, (hop.avg_ms / ceil) * 100)) : minPct;
-  const lastPct = hop.last_ms !== null ? Math.min(98, Math.max(0, (hop.last_ms / ceil) * 100)) : null;
-
-  let barColor = 'bg-emerald-500/40 border-emerald-500/70';
-  if (hop.rolling_loss_pct >= 5) {
-    barColor = 'bg-rose-500/40 border-rose-500/70';
-  } else if (hop.avg_ms > 100 || hop.jitter_ms > 20) {
-    barColor = 'bg-amber-500/40 border-amber-500/70';
-  }
+  const lastPct =
+    hop.last_ms !== null ? Math.min(98, Math.max(0, (hop.last_ms / ceil) * 100)) : null;
 
   return `
-    <div class="flex-1 h-3 bg-slate-900 rounded relative overflow-hidden border border-slate-800" title="Min: ${formatMs(hop.min_ms)} | Avg: ${formatMs(hop.avg_ms)} | Max: ${formatMs(hop.max_ms)}">
-      <div class="absolute top-0.5 bottom-0.5 rounded border ${barColor}"
-           style="left: ${minPct}%; width: ${Math.max(3, maxPct - minPct)}%;"></div>
-      <div class="absolute top-0 bottom-0 w-0.5 bg-amber-300" style="left: ${avgPct}%;"></div>
+    <div class="flex-1 h-2 bg-slate-900 rounded relative overflow-hidden">
+      <div class="absolute top-0 bottom-0 bg-slate-700 rounded"
+           style="left: ${minPct}%; width: ${Math.max(2, maxPct - minPct)}%;"></div>
       ${
         lastPct !== null
-          ? `<div class="absolute top-0.5 w-2 h-2 rounded-full bg-cyan-300 shadow" style="left: calc(${lastPct}% - 4px);"></div>`
+          ? `<div class="absolute top-0 bottom-0 w-1.5 rounded-full bg-cyan-400" style="left: calc(${lastPct}% - 3px);"></div>`
           : ''
       }
     </div>
@@ -435,14 +403,14 @@ function buildLatencyRangeBar(hop, scaleMaxMs) {
 
 function renderHopTable() {
   const targetId = state.selectedTargetId;
-  const hops = (targetId && state.hopsByTarget[targetId]) ? state.hopsByTarget[targetId] : [];
+  const hops = targetId && state.hopsByTarget[targetId] ? state.hopsByTarget[targetId] : [];
   elHopTableBody.innerHTML = '';
 
   if (hops.length === 0) {
     elHopTableBody.innerHTML = `
       <tr>
-        <td colspan="11" class="py-10 text-center text-slate-400 font-sans text-xs">
-          Probing route hops via MTR Engine... results will appear momentarily.
+        <td colspan="11" class="py-8 text-center text-slate-500 font-sans text-xs">
+          Tracing route hops...
         </td>
       </tr>
     `;
@@ -451,10 +419,7 @@ function renderHopTable() {
 
   const plottedSet = getPlottedSet(targetId, hops);
   const finalHopNum = hops[hops.length - 1].hop_num;
-  const scaleMaxMs = Math.max(
-    25,
-    ...hops.map((h) => Number(h.max_ms || 0))
-  );
+  const scaleMaxMs = Math.max(25, ...hops.map((h) => Number(h.max_ms || 0)));
 
   for (const h of hops) {
     const isFinal = h.hop_num === finalHopNum;
@@ -462,26 +427,15 @@ function renderHopTable() {
     const hopColor = colorForHop(h.hop_num, isFinal);
     const lossVal = Number(h.rolling_loss_pct || 0);
 
-    let lossBadgeClass = 'text-emerald-400 bg-emerald-950/50 border-emerald-800/60';
-    if (lossVal >= 5 && h.ip_address !== '???') {
-      lossBadgeClass = 'text-rose-300 bg-rose-950/80 border-rose-700 font-bold';
-    } else if (lossVal > 0 && h.ip_address !== '???') {
-      lossBadgeClass = 'text-amber-300 bg-amber-950/70 border-amber-700';
-    } else if (h.ip_address === '???') {
-      lossBadgeClass = 'text-slate-500 bg-slate-900 border-slate-800';
-    }
-
     const rdnsDisplay =
       h.rdns_hostname && h.rdns_hostname !== h.ip_address && h.rdns_hostname !== '???'
-        ? `<span class="text-slate-200 font-medium">${escapeHtml(h.rdns_hostname)}</span> <span class="text-slate-400">(${escapeHtml(h.ip_address)})</span>`
-        : `<span class="${h.ip_address === '???' ? 'text-slate-500 italic' : 'text-slate-200'}">${
-            h.ip_address === '???' ? 'No Response (ICMP Timeout)' : escapeHtml(h.ip_address)
+        ? `<span class="text-slate-200">${escapeHtml(h.rdns_hostname)}</span> <span class="text-slate-500">(${escapeHtml(h.ip_address)})</span>`
+        : `<span class="${h.ip_address === '???' ? 'text-slate-600' : 'text-slate-200'}">${
+            h.ip_address === '???' ? '* * *' : escapeHtml(h.ip_address)
           }</span>`;
 
     const tr = document.createElement('tr');
-    tr.className = `hover:bg-slate-900/90 transition ${
-      isFinal ? 'bg-cyan-950/15' : ''
-    }`;
+    tr.className = `hover:bg-slate-900/60 transition ${isFinal ? 'bg-cyan-950/10' : ''}`;
 
     tr.innerHTML = `
       <td class="py-1.5 px-3 text-center">
@@ -490,35 +444,37 @@ function renderHopTable() {
                class="w-3.5 h-3.5 rounded cursor-pointer"
                data-hop="${h.hop_num}" />
       </td>
-      <td class="py-1.5 px-2 font-semibold ${isFinal ? 'text-cyan-400' : 'text-slate-400'}">
-        #${h.hop_num}
+      <td class="py-1.5 px-2 ${isFinal ? 'text-cyan-400 font-semibold' : 'text-slate-500'}">
+        ${h.hop_num}
       </td>
-      <td class="py-1.5 px-3 truncate max-w-xs">
-        ${rdnsDisplay}
-      </td>
-      <td class="py-1.5 px-2 text-right">
-        <span class="px-1.5 py-0.5 rounded border text-[11px] ${lossBadgeClass}">
-          ${h.ip_address === '???' ? '100%' : `${lossVal.toFixed(1)}%`}
-        </span>
-      </td>
-      <td class="py-1.5 px-2 text-right text-slate-300">${h.sent}</td>
-      <td class="py-1.5 px-2 text-right font-semibold ${
-        h.last_ms !== null ? 'text-white' : 'text-rose-400'
-      }">${h.last_ms !== null ? h.last_ms.toFixed(1) : 'TIMEOUT'}</td>
-      <td class="py-1.5 px-2 text-right text-slate-300">${
-        h.avg_ms !== null ? h.avg_ms.toFixed(1) : '---'
-      }</td>
-      <td class="py-1.5 px-2 text-right text-emerald-400/90">${
-        h.min_ms !== null ? h.min_ms.toFixed(1) : '---'
-      }</td>
-      <td class="py-1.5 px-2 text-right text-amber-400/90">${
-        h.max_ms !== null ? h.max_ms.toFixed(1) : '---'
-      }</td>
+      <td class="py-1.5 px-3 truncate max-w-xs">${rdnsDisplay}</td>
       <td class="py-1.5 px-2 text-right ${
-        h.jitter_ms > 20 ? 'text-amber-300 font-semibold' : 'text-slate-300'
-      }">${h.jitter_ms !== null ? h.jitter_ms.toFixed(1) : '0.0'}</td>
+        lossVal >= 5 && h.ip_address !== '???'
+          ? 'text-rose-400 font-semibold'
+          : lossVal > 0 && h.ip_address !== '???'
+          ? 'text-amber-400'
+          : 'text-slate-400'
+      }">
+        ${h.ip_address === '???' ? '--' : `${lossVal.toFixed(1)}%`}
+      </td>
+      <td class="py-1.5 px-2 text-right text-slate-400">${h.sent}</td>
+      <td class="py-1.5 px-2 text-right ${
+        h.last_ms !== null ? 'text-slate-100' : 'text-slate-600'
+      }">${h.last_ms !== null ? h.last_ms.toFixed(1) : '--'}</td>
+      <td class="py-1.5 px-2 text-right text-slate-400">${
+        h.avg_ms !== null ? h.avg_ms.toFixed(1) : '--'
+      }</td>
+      <td class="py-1.5 px-2 text-right text-slate-400">${
+        h.min_ms !== null ? h.min_ms.toFixed(1) : '--'
+      }</td>
+      <td class="py-1.5 px-2 text-right text-slate-400">${
+        h.max_ms !== null ? h.max_ms.toFixed(1) : '--'
+      }</td>
+      <td class="py-1.5 px-2 text-right text-slate-400">${
+        h.jitter_ms !== null ? h.jitter_ms.toFixed(1) : '0.0'
+      }</td>
       <td class="py-1.5 px-4">
-        <div class="flex items-center space-x-2">
+        <div class="flex items-center space-x-3">
           ${buildLatencyRangeBar(h, scaleMaxMs)}
           ${buildSparklineSvg(h.sparkline, scaleMaxMs)}
         </div>
@@ -529,11 +485,8 @@ function renderHopTable() {
     checkbox.addEventListener('change', (e) => {
       const hopNum = Number(e.target.getAttribute('data-hop'));
       const set = getPlottedSet(targetId, hops);
-      if (e.target.checked) {
-        set.add(hopNum);
-      } else {
-        set.delete(hopNum);
-      }
+      if (e.target.checked) set.add(hopNum);
+      else set.delete(hopNum);
       renderTimelineChart();
     });
 
@@ -542,7 +495,7 @@ function renderHopTable() {
 }
 
 // ============================================================================
-// API Interactions & Target Selection
+// API & WebSocket
 // ============================================================================
 async function selectTarget(targetId) {
   state.selectedTargetId = targetId;
@@ -585,40 +538,29 @@ async function loadHistoryForCurrentTarget() {
   }
 }
 
-// ============================================================================
-// WebSocket Client with Auto-Reconnect
-// ============================================================================
 function connectWebSocket() {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${proto}//${window.location.host}/ws`;
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
   state.ws = ws;
 
   ws.onopen = () => {
-    elWsDot.className = 'w-2 h-2 rounded-full bg-emerald-400';
-    elWsText.textContent = 'Live Connected';
     if (state.wsPingTimer) clearInterval(state.wsPingTimer);
     state.wsPingTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send('ping');
-      }
+      if (ws.readyState === WebSocket.OPEN) ws.send('ping');
     }, 15000);
   };
 
   ws.onmessage = (event) => {
     try {
-      const msg = JSON.parse(event.data);
-      handleWsMessage(msg);
+      handleWsMessage(JSON.parse(event.data));
     } catch (err) {
       console.error('WS parse error:', err);
     }
   };
 
   ws.onclose = () => {
-    elWsDot.className = 'w-2 h-2 rounded-full bg-rose-500 animate-ping';
-    elWsText.textContent = 'Reconnecting...';
     if (state.wsPingTimer) clearInterval(state.wsPingTimer);
-    setTimeout(connectWebSocket, 2500);
+    setTimeout(connectWebSocket, 2000);
   };
 }
 
@@ -640,7 +582,6 @@ function handleWsMessage(msg) {
     const tId = msg.target_id;
     state.hopsByTarget[tId] = msg.hops || [];
 
-    // Update target summary in sidebar list
     const targetObj = state.targets.find((t) => t.id === tId);
     if (targetObj && msg.summary) {
       targetObj.current_ms = msg.summary.current_ms;
@@ -651,14 +592,11 @@ function handleWsMessage(msg) {
     }
     renderTargetList();
 
-    // If this probe update is for the active target, update Hop Table and live Chart
     if (tId === state.selectedTargetId) {
       const cutoffTs = msg.timestamp - state.windowSeconds;
       for (const h of msg.hops || []) {
         const key = String(h.hop_num);
-        if (!state.historySeries[key]) {
-          state.historySeries[key] = [];
-        }
+        if (!state.historySeries[key]) state.historySeries[key] = [];
         const seriesArr = state.historySeries[key];
         const isLoss = h.last_ms === null && h.ip_address !== '???';
         seriesArr.push({
@@ -677,28 +615,37 @@ function handleWsMessage(msg) {
 }
 
 // ============================================================================
-// UI Event Listeners
+// Event Listeners
 // ============================================================================
 function bindEvents() {
-  // Time window buttons
   document.querySelectorAll('.time-window-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.time-window-btn').forEach((b) => {
         b.className =
-          'time-window-btn px-2 py-1 rounded text-xs font-mono bg-slate-800 text-slate-300 hover:bg-slate-700';
+          'time-window-btn px-2 py-0.5 rounded text-xs font-mono text-slate-400 hover:text-slate-200';
       });
-      btn.className = 'time-window-btn px-2 py-1 rounded text-xs font-mono bg-cyan-600 text-white';
+      btn.className = 'time-window-btn px-2 py-0.5 rounded text-xs font-mono bg-cyan-600 text-white';
       state.windowSeconds = Number(btn.getAttribute('data-window'));
       loadHistoryForCurrentTarget();
     });
   });
 
-  // Reset Zoom
   document.getElementById('btnResetZoom').addEventListener('click', () => {
     if (state.chart) state.chart.resetZoom();
   });
 
-  // Pause / Resume Target
+  // Live Adjustable Interval Dropdown
+  elSelectInterval.addEventListener('change', async (e) => {
+    const target = state.targets.find((t) => t.id === state.selectedTargetId);
+    if (!target) return;
+    const interval_sec = Number(e.target.value);
+    await fetch(`/api/targets/${target.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ interval_sec }),
+    });
+  });
+
   elBtnTogglePause.addEventListener('click', async () => {
     const target = state.targets.find((t) => t.id === state.selectedTargetId);
     if (!target) return;
@@ -709,7 +656,6 @@ function bindEvents() {
     });
   });
 
-  // Reset Target Statistics
   elBtnResetStats.addEventListener('click', async () => {
     if (!state.selectedTargetId) return;
     await fetch(`/api/targets/${state.selectedTargetId}/reset`, { method: 'POST' });
@@ -719,15 +665,13 @@ function bindEvents() {
     renderTimelineChart();
   });
 
-  // Delete Target
   elBtnDeleteTarget.addEventListener('click', async () => {
     const target = state.targets.find((t) => t.id === state.selectedTargetId);
     if (!target) return;
-    if (!confirm(`Delete target "${target.label} (${target.host})"?`)) return;
+    if (!confirm(`Delete target "${target.label}"?`)) return;
     await fetch(`/api/targets/${target.id}`, { method: 'DELETE' });
   });
 
-  // Add Target Modal open/close
   const openModal = () => {
     elAddError.classList.add('hidden');
     elAddForm.reset();
@@ -749,7 +693,7 @@ function bindEvents() {
     elAddError.classList.add('hidden');
     const host = document.getElementById('inputTargetHost').value.trim();
     const label = document.getElementById('inputTargetLabel').value.trim();
-    const interval_sec = Number(document.getElementById('inputTargetInterval').value || 2.0);
+    const interval_sec = Number(document.getElementById('inputTargetInterval').value || 1.0);
 
     try {
       const res = await fetch('/api/targets', {
@@ -764,9 +708,7 @@ function bindEvents() {
         return;
       }
       closeModal();
-      if (data.target && data.target.id) {
-        selectTarget(data.target.id);
-      }
+      if (data.target && data.target.id) selectTarget(data.target.id);
     } catch (err) {
       elAddError.textContent = String(err);
       elAddError.classList.remove('hidden');
@@ -782,9 +724,6 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-// ============================================================================
-// Bootstrap
-// ============================================================================
 window.addEventListener('DOMContentLoaded', () => {
   initTimelineChart();
   bindEvents();

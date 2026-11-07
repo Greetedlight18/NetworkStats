@@ -10,12 +10,13 @@ logger = logging.getLogger("NetworkStats.database")
 
 DB_PATH = os.getenv("DB_PATH", "/data/networkstats.db")
 RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "48"))
+DEFAULT_INTERVAL = float(os.getenv("PROBE_INTERVAL", "1.0"))
 
 DEFAULT_TARGETS = [
-    {"host": "10.0.0.1", "label": "Default Local Gateway", "interval_sec": 2.0},
-    {"host": "1.1.1.1", "label": "Cloudflare DNS", "interval_sec": 2.0},
-    {"host": "8.8.8.8", "label": "Google DNS", "interval_sec": 2.0},
-    {"host": "9.9.9.9", "label": "Quad9 DNS", "interval_sec": 2.0},
+    {"host": "10.0.0.1", "label": "Local Gateway", "interval_sec": DEFAULT_INTERVAL},
+    {"host": "1.1.1.1", "label": "Cloudflare DNS", "interval_sec": DEFAULT_INTERVAL},
+    {"host": "8.8.8.8", "label": "Google DNS", "interval_sec": DEFAULT_INTERVAL},
+    {"host": "9.9.9.9", "label": "Quad9 DNS", "interval_sec": DEFAULT_INTERVAL},
 ]
 
 
@@ -46,7 +47,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 host TEXT NOT NULL UNIQUE,
                 label TEXT NOT NULL,
-                interval_sec REAL NOT NULL DEFAULT 2.0,
+                interval_sec REAL NOT NULL DEFAULT 1.0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL
             );
@@ -118,7 +119,6 @@ def list_targets() -> List[Dict[str, Any]]:
         result: List[Dict[str, Any]] = []
         for row in rows:
             t_id = row["id"]
-            # Find highest responding hop or last hop in hop_state
             final_hop = conn.execute(
                 """
                 SELECT hop_num, ip_address, rdns_hostname, sent, lost, loss_pct,
@@ -185,11 +185,11 @@ def get_target(target_id: int) -> Optional[Dict[str, Any]]:
         }
 
 
-def add_target(host: str, label: str, interval_sec: float = 2.0) -> Dict[str, Any]:
+def add_target(host: str, label: str, interval_sec: float = 1.0) -> Dict[str, Any]:
     now = int(time.time())
     clean_host = host.strip()
     clean_label = label.strip() or clean_host
-    interval_sec = max(1.0, min(60.0, float(interval_sec)))
+    interval_sec = max(0.5, min(60.0, float(interval_sec)))
     with get_db_connection() as conn:
         cur = conn.execute(
             """
@@ -213,7 +213,7 @@ def update_target(
         return None
     new_label = label.strip() if label is not None else existing["label"]
     new_interval = (
-        max(1.0, min(60.0, float(interval_sec)))
+        max(0.5, min(60.0, float(interval_sec)))
         if interval_sec is not None
         else existing["interval_sec"]
     )
@@ -375,8 +375,7 @@ def get_target_history(
     now = int(time.time())
     since_ts = now - window_seconds
 
-    # Determine bucket size to cap series around ~450 points max
-    if window_seconds <= 900:       # <= 15m: raw samples (every 2s)
+    if window_seconds <= 900:       # <= 15m: raw samples
         bucket_sec = 1
     elif window_seconds <= 3600:    # 1h: 10s buckets
         bucket_sec = 10
@@ -387,7 +386,6 @@ def get_target_history(
 
     with get_db_connection() as conn:
         if not hop_nums:
-            # Default to final hop + all hops available so UI can toggle intermediate hops
             rows_hops = conn.execute(
                 "SELECT DISTINCT hop_num FROM hop_state WHERE target_id = ? ORDER BY hop_num ASC",
                 (target_id,),
