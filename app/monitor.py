@@ -10,7 +10,7 @@ import socket
 import time
 from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional, Tuple
 
-from icmplib import async_multiping, async_traceroute
+from icmplib import async_multiping, traceroute
 
 from app import database
 
@@ -102,13 +102,12 @@ class SharedPingProber:
                     responses = await async_multiping(
                         to_ping,
                         count=1,
-                        interval=0.015,
                         timeout=0.8,
                         privileged=True,
                     )
                     resp_time = time.monotonic()
                     for r in responses:
-                        if r.is_alive and r.avg_rtt is not None:
+                        if r.is_alive:
                             ms = round(float(r.avg_rtt), 2)
                             self._cache[r.address] = (ms, False, resp_time + SHARED_PING_CACHE_TTL)
                             results[r.address] = (ms, False)
@@ -528,7 +527,13 @@ class MonitorEngine:
 
         if not raw_ips:
             try:
-                hops = await async_traceroute(dest_ip, count=1, timeout=0.8, max_hops=24)
+                loop = asyncio.get_running_loop()
+                hops = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: traceroute(dest_ip, count=1, timeout=0.8, max_hops=24)
+                    ),
+                    timeout=10.0,
+                )
                 raw_ips = [h.address for h in hops if h.address]
             except Exception as exc:
                 logger.debug("icmplib route discovery error for %s: %s", host, exc)
