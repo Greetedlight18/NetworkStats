@@ -47,13 +47,26 @@
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans antialiased h-screen flex flex-col overflow-hidden select-none">
 
-  <!-- Minimal Top Navbar -->
+  <!-- Top Navbar with View Switcher Tabs -->
   <header class="h-12 bg-slate-925 border-b border-slate-800/80 px-4 flex items-center justify-between shrink-0">
-    <div class="flex items-center space-x-2.5">
-      <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l3-9 4 18 3-9h4" />
-      </svg>
-      <span class="font-semibold text-sm tracking-tight text-white">NetworkStats</span>
+    <div class="flex items-center space-x-6">
+      <div class="flex items-center space-x-2.5">
+        <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l3-9 4 18 3-9h4" />
+        </svg>
+        <span class="font-semibold text-sm tracking-tight text-white">NetworkStats</span>
+      </div>
+
+      <!-- Main View Tabs -->
+      <nav class="flex items-center space-x-1 bg-slate-900/90 p-1 rounded-lg border border-slate-800/80">
+        <button id="tabBtnLive" class="px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white transition">
+          Live Monitor
+        </button>
+        <button id="tabBtnLossLog" class="px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 transition">
+          <span>Packet Loss Log</span>
+          <span id="lossLogBadge" class="hidden px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-rose-500/20 text-rose-400 border border-rose-500/30">0</span>
+        </button>
+      </nav>
     </div>
 
     <button id="btnOpenAddModal" class="px-3 py-1.5 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white font-medium text-xs flex items-center space-x-1.5 transition">
@@ -79,8 +92,10 @@
       </div>
     </aside>
 
-    <!-- Main Right Pane -->
-    <main class="flex-1 flex flex-col overflow-hidden bg-slate-950">
+    <!-- ================================================================== -->
+    <!-- VIEW 1: LIVE MONITOR (Hop Table + Timeline Graph)                  -->
+    <!-- ================================================================== -->
+    <main id="viewLiveMonitor" class="flex-1 flex flex-col overflow-hidden bg-slate-950">
 
       <!-- Active Target Toolbar -->
       <div class="h-11 bg-slate-900/50 border-b border-slate-800/80 px-4 flex items-center justify-between shrink-0">
@@ -130,7 +145,8 @@
                 <th class="py-2 px-3 w-10 text-center">Plot</th>
                 <th class="py-2 px-2 w-12">#</th>
                 <th class="py-2 px-3">Host / IP</th>
-                <th class="py-2 px-2 w-20 text-right">Loss</th>
+                <th class="py-2 px-2 w-20 text-right">Loss %</th>
+                <th class="py-2 px-2 w-16 text-right">Lost</th>
                 <th class="py-2 px-2 w-16 text-right">Sent</th>
                 <th class="py-2 px-2 w-20 text-right">Last</th>
                 <th class="py-2 px-2 w-20 text-right">Avg</th>
@@ -173,6 +189,59 @@
       </section>
 
     </main>
+
+    <!-- ================================================================== -->
+    <!-- VIEW 2: PACKET LOSS LOG (Chronological Outage & Spike History)     -->
+    <!-- ================================================================== -->
+    <main id="viewLossLog" class="hidden flex-1 flex-col overflow-hidden bg-slate-950">
+      <div class="h-11 bg-slate-900/50 border-b border-slate-800/80 px-4 flex items-center justify-between shrink-0">
+        <div class="flex items-center space-x-4">
+          <span class="font-medium text-sm text-white">Packet Loss History</span>
+          <div class="flex items-center space-x-3 text-xs font-mono text-slate-400">
+            <span>Incidents: <strong id="lossLogTotalIncidents" class="text-rose-400">0</strong></span>
+            <span>Dropped Packets: <strong id="lossLogTotalPackets" class="text-rose-400">0</strong></span>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-2">
+          <!-- Filter by Target -->
+          <select id="selectLossTargetFilter" class="bg-slate-900 border border-slate-800 rounded px-2.5 py-1 text-xs text-slate-200 focus:outline-none">
+            <option value="">All Targets</option>
+          </select>
+
+          <!-- Filter by Time Window -->
+          <select id="selectLossWindowFilter" class="bg-slate-900 border border-slate-800 rounded px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none">
+            <option value="3600">Last 1h</option>
+            <option value="21600">Last 6h</option>
+            <option value="86400" selected>Last 24h</option>
+            <option value="172800">Last 48h</option>
+          </select>
+
+          <button id="btnRefreshLossLog" class="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 text-xs transition">
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 overflow-auto">
+        <table class="w-full text-left border-collapse">
+          <thead class="bg-slate-925 sticky top-0 z-10 border-b border-slate-800/80 text-[11px] font-medium text-slate-400">
+            <tr>
+              <th class="py-2.5 px-4 w-44">Time</th>
+              <th class="py-2.5 px-3 w-28">Ago</th>
+              <th class="py-2.5 px-3 w-48">Target</th>
+              <th class="py-2.5 px-3 w-48">Source / Root Cause</th>
+              <th class="py-2.5 px-3 w-28 text-right">Lost</th>
+              <th class="py-2.5 px-4">Affected Hops at Timestamp</th>
+            </tr>
+          </thead>
+          <tbody id="lossLogTableBody" class="divide-y divide-slate-800/40 text-xs font-mono">
+            <!-- Populated by app.js -->
+          </tbody>
+        </table>
+      </div>
+    </main>
+
   </div>
 
   <!-- Add Target Modal -->

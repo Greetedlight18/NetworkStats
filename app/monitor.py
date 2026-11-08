@@ -511,6 +511,8 @@ class MonitorEngine:
                                 "rolling_loss_pct": (
                                     final_hop["rolling_loss_pct"] if final_hop else 0.0
                                 ),
+                                "loss_pct": final_hop["loss_pct"] if final_hop else 0.0,
+                                "lost_count": final_hop["lost"] if final_hop else 0,
                                 "hop_count": len(hop_states),
                             },
                         }

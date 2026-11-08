@@ -89,6 +89,9 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_hop_metrics_target_hop_ts
                 ON hop_metrics(target_id, hop_num, timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_hop_metrics_loss_ts
+                ON hop_metrics(is_loss, timestamp);
             """
         )
 
@@ -108,9 +111,7 @@ def init_db() -> None:
 
 
 def list_targets() -> List[Dict[str, Any]]:
-    """Return all targets along with their latest final-hop summary and 1-hour packet loss."""
-    now = int(time.time())
-    one_hour_ago = now - 3600
+    """Return all targets along with their latest final-hop summary."""
     with get_db_connection() as conn:
         rows = conn.execute(
             "SELECT id, host, label, interval_sec, enabled, created_at FROM targets ORDER BY id ASC"
@@ -131,9 +132,9 @@ def list_targets() -> List[Dict[str, Any]]:
                 (t_id,),
             ).fetchone()
 
-            loss_1h = 0.0
-            if final_hop:
-                loss_1h = round(float(final_hop["rolling_loss_pct"]), 1)
+            total_loss_pct = round(float(final_hop["loss_pct"]), 1) if final_hop else 0.0
+            rolling_loss_pct = round(float(final_hop["rolling_loss_pct"]), 1) if final_hop else 0.0
+            lost_count = int(final_hop["lost"]) if final_hop else 0
 
             result.append(
                 {
@@ -146,8 +147,10 @@ def list_targets() -> List[Dict[str, Any]]:
                     "current_ms": final_hop["last_ms"] if final_hop else None,
                     "avg_ms": final_hop["avg_ms"] if final_hop else None,
                     "jitter_ms": final_hop["jitter_ms"] if final_hop else 0.0,
-                    "rolling_loss_pct": final_hop["rolling_loss_pct"] if final_hop else 0.0,
-                    "loss_1h_pct": loss_1h,
+                    "rolling_loss_pct": rolling_loss_pct,
+                    "loss_pct": total_loss_pct,
+                    "loss_1h_pct": total_loss_pct,
+                    "lost_count": lost_count,
                     "hop_count": final_hop["hop_num"] if final_hop else 0,
                     "updated_at": final_hop["updated_at"] if final_hop else None,
                 }
@@ -358,19 +361,19 @@ def get_target_history(
 ) -> Dict[str, Any]:
     """
     Retrieve time-series metrics for the requested target and time window.
-    Automatically buckets data when window_seconds is large so the browser chart stays fast.
+    Uses MAX(is_loss) when bucketing so packet loss spikes never get averaged away.
     """
     now = int(time.time())
     since_ts = now - window_seconds
 
-    if window_seconds <= 900:       # <= 15m: raw samples
+    if window_seconds <= 1800:      # <= 30m: raw 1s samples
         bucket_sec = 1
-    elif window_seconds <= 3600:    # 1h: 10s buckets
-        bucket_sec = 10
-    elif window_seconds <= 21600:   # 6h: 60s buckets
-        bucket_sec = 60
-    else:                           # 24h+: 180s buckets
-        bucket_sec = 180
+    elif window_seconds <= 3600:    # 1h: 5s buckets
+        bucket_sec = 5
+    elif window_seconds <= 21600:   # 6h: 30s buckets
+        bucket_sec = 30
+    else:                           # 24h+: 120s buckets
+        bucket_sec = 120
 
     with get_db_connection() as conn:
         if not hop_nums:
@@ -399,7 +402,7 @@ def get_target_history(
                 SELECT hop_num,
                        (timestamp / ?) * ? AS bucket_ts,
                        ROUND(AVG(latency_ms), 2) AS latency_ms,
-                       ROUND(AVG(is_loss) * 100.0, 2) AS loss_pct
+                       CASE WHEN MAX(is_loss) = 1 THEN 100.0 ELSE 0.0 END AS loss_pct
                 FROM hop_metrics
                 WHERE target_id = ? AND timestamp >= ? AND hop_num IN ({placeholders})
                 GROUP BY hop_num, bucket_ts
@@ -428,6 +431,145 @@ def get_target_history(
             "bucket_sec": bucket_sec,
             "series": series,
         }
+
+
+def get_loss_events(
+    window_seconds: int = 86400,
+    target_id: Optional[int] = None,
+    limit: int = 300,
+) -> Dict[str, Any]:
+    """
+    Build a chronological log of Packet Loss incidents across targets.
+    Groups consecutive lost ticks (within 4 seconds) on the same target into a single
+    incident and identifies whether the drop started at the Local Router (Hop 1),
+    ISP (Hop 2-3), or the Destination/Game Server.
+    """
+    now = int(time.time())
+    since_ts = now - window_seconds
+
+    with get_db_connection() as conn:
+        targets_rows = conn.execute("SELECT id, host, label FROM targets").fetchall()
+        target_map = {r["id"]: {"host": r["host"], "label": r["label"]} for r in targets_rows}
+
+        if not target_map:
+            return {"events": [], "summary": {"total_incidents": 0, "total_packets_lost": 0}}
+
+        # Get current max hop per target from hop_state so we know which hop is the final destination
+        final_hops_rows = conn.execute(
+            """
+            SELECT target_id, MAX(hop_num) AS max_hop, ip_address
+            FROM hop_state
+            GROUP BY target_id
+            """
+        ).fetchall()
+        final_hop_map = {r["target_id"]: r["max_hop"] for r in final_hops_rows}
+
+        target_filter_sql = "AND target_id = ?" if target_id is not None else ""
+        params: List[Any] = [since_ts]
+        if target_id is not None:
+            params.append(target_id)
+
+        # Fetch all timestamps where at least one hop (excluding '???') had packet loss
+        loss_rows = conn.execute(
+            f"""
+            SELECT target_id, timestamp, hop_num, ip_address, rdns_hostname
+            FROM hop_metrics
+            WHERE is_loss = 1
+              AND ip_address != '???'
+              AND timestamp >= ?
+              {target_filter_sql}
+            ORDER BY timestamp DESC, target_id ASC, hop_num ASC
+            LIMIT 4000
+            """,
+            params,
+        ).fetchall()
+
+    # Group by (target_id, timestamp) first
+    ticks_by_target: Dict[int, Dict[int, List[Dict[str, Any]]]] = {}
+    for r in loss_rows:
+        t_id = r["target_id"]
+        if t_id not in target_map:
+            continue
+        ts = r["timestamp"]
+        ticks_by_target.setdefault(t_id, {}).setdefault(ts, []).append(
+            {
+                "hop_num": r["hop_num"],
+                "ip_address": r["ip_address"],
+                "rdns_hostname": r["rdns_hostname"],
+            }
+        )
+
+    incidents: List[Dict[str, Any]] = []
+    total_packets_lost = 0
+
+    for t_id, ts_map in ticks_by_target.items():
+        t_meta = target_map[t_id]
+        max_hop = final_hop_map.get(t_id, 1)
+        sorted_timestamps = sorted(ts_map.keys())
+
+        current_inc: Optional[Dict[str, Any]] = None
+        for ts in sorted_timestamps:
+            dropped_hops = ts_map[ts]
+            hop_nums = [h["hop_num"] for h in dropped_hops]
+            final_dropped = max_hop in hop_nums
+            min_hop = min(hop_nums)
+
+            # Determine root cause for this tick
+            if 1 in hop_nums and max_hop > 1:
+                cause = "Local Router (Hop #1)"
+                severity = "router"
+            elif any(h in (2, 3) for h in hop_nums) and max_hop > 3:
+                cause = f"ISP Network (Hop #{min_hop})"
+                severity = "isp"
+            elif final_dropped:
+                cause = "Target / Game Server"
+                severity = "target"
+            else:
+                cause = f"Route Hop #{min_hop}"
+                severity = "route"
+
+            hop_labels = [
+                f"#{h['hop_num']} ({h['rdns_hostname'] if h['rdns_hostname'] != '???' else h['ip_address']})"
+                for h in dropped_hops
+            ]
+
+            if current_inc and (ts - current_inc["end_ts"] <= 4) and current_inc["cause"] == cause:
+                current_inc["end_ts"] = ts
+                current_inc["packets_lost"] += 1
+                current_inc["final_dropped"] = current_inc["final_dropped"] or final_dropped
+                for lbl in hop_labels:
+                    if lbl not in current_inc["hops"]:
+                        current_inc["hops"].append(lbl)
+            else:
+                if current_inc:
+                    incidents.append(current_inc)
+                current_inc = {
+                    "target_id": t_id,
+                    "target_label": t_meta["label"],
+                    "target_host": t_meta["host"],
+                    "start_ts": ts,
+                    "end_ts": ts,
+                    "packets_lost": 1,
+                    "final_dropped": final_dropped,
+                    "cause": cause,
+                    "severity": severity,
+                    "hops": hop_labels,
+                }
+            total_packets_lost += 1
+
+        if current_inc:
+            incidents.append(current_inc)
+
+    incidents.sort(key=lambda x: x["start_ts"], reverse=True)
+    incidents = incidents[:limit]
+
+    return {
+        "events": incidents,
+        "summary": {
+            "total_incidents": len(incidents),
+            "total_packets_lost": total_packets_lost,
+        },
+    }
 
 
 def prune_old_metrics() -> int:

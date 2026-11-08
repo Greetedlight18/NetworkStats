@@ -212,6 +212,14 @@ async def api_get_target_history(
     return history
 
 
+@app.get("/api/loss-events")
+async def api_get_loss_events(
+    window: int = Query(default=86400, ge=60, le=172800, description="Time window in seconds"),
+    target_id: Optional[int] = Query(default=None, description="Optional target ID filter"),
+):
+    return database.get_loss_events(window_seconds=window, target_id=target_id)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)

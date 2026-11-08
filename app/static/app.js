@@ -1,5 +1,5 @@
 /**
- * NetworkStats — Clean Real-Time UI Controller
+ * NetworkStats — Clean Real-Time UI & Packet Loss Log Controller
  */
 
 const HOP_PALETTE = [
@@ -16,6 +16,7 @@ const HOP_PALETTE = [
 ];
 
 const state = {
+  activeTab: 'live', // 'live' | 'losslog'
   targets: [],
   selectedTargetId: null,
   hopsByTarget: {},
@@ -44,6 +45,18 @@ const elBtnResetStats = document.getElementById('btnResetStats');
 const elBtnDeleteTarget = document.getElementById('btnDeleteTarget');
 const elPlottedSummary = document.getElementById('plottedHopsSummary');
 
+// View & Tab Elements
+const elTabBtnLive = document.getElementById('tabBtnLive');
+const elTabBtnLossLog = document.getElementById('tabBtnLossLog');
+const elLossLogBadge = document.getElementById('lossLogBadge');
+const elViewLive = document.getElementById('viewLiveMonitor');
+const elViewLossLog = document.getElementById('viewLossLog');
+const elLossLogTableBody = document.getElementById('lossLogTableBody');
+const elLossLogTotalIncidents = document.getElementById('lossLogTotalIncidents');
+const elLossLogTotalPackets = document.getElementById('lossLogTotalPackets');
+const elSelectLossTargetFilter = document.getElementById('selectLossTargetFilter');
+const elSelectLossWindowFilter = document.getElementById('selectLossWindowFilter');
+
 // Modal Elements
 const elAddModal = document.getElementById('addTargetModal');
 const elAddForm = document.getElementById('addTargetForm');
@@ -58,7 +71,7 @@ function getTargetStatus(target) {
   if (!target.enabled) {
     return { color: 'bg-slate-600' };
   }
-  const loss = Math.max(Number(target.rolling_loss_pct || 0), Number(target.loss_1h_pct || 0));
+  const loss = Number(target.rolling_loss_pct || 0);
   const ping = target.current_ms;
   const jitter = Number(target.jitter_ms || 0);
 
@@ -82,6 +95,39 @@ function formatTimeLabel(unixSec, windowSec) {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function formatRelativeAgo(unixSec) {
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)}m ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+// ============================================================================
+// Tab Switching
+// ============================================================================
+function switchTab(tabName) {
+  state.activeTab = tabName;
+  if (tabName === 'live') {
+    elTabBtnLive.className = 'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white transition';
+    elTabBtnLossLog.className =
+      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 transition';
+    elViewLive.classList.remove('hidden');
+    elViewLossLog.classList.add('hidden');
+    elViewLossLog.classList.remove('flex');
+    renderTimelineChart();
+  } else {
+    elTabBtnLossLog.className =
+      'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white flex items-center space-x-1.5 transition';
+    elTabBtnLive.className =
+      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 transition';
+    elViewLive.classList.add('hidden');
+    elViewLossLog.classList.remove('hidden');
+    elViewLossLog.classList.add('flex');
+    loadLossLog();
+  }
 }
 
 // ============================================================================
@@ -237,6 +283,7 @@ function renderTimelineChart() {
     });
   }
 
+  // Fixed 3px barThickness + null for 0% loss so red spikes stay visible on 15m/1h/6h/24h!
   if (primaryHop !== undefined) {
     const ptMap = new Map();
     for (const pt of state.historySeries[String(primaryHop)] || []) {
@@ -244,15 +291,15 @@ function renderTimelineChart() {
     }
     datasets.push({
       type: 'bar',
-      label: 'Loss %',
+      label: 'Packet Loss',
       data: sortedTs.map((ts) => {
         const item = ptMap.get(ts);
-        return item && item.loss > 0 ? item.loss : 0;
+        return item && item.loss > 0 ? item.loss : null;
       }),
-      backgroundColor: 'rgba(244, 63, 94, 0.7)',
-      borderWidth: 0,
-      barPercentage: 0.9,
-      categoryPercentage: 0.95,
+      backgroundColor: 'rgba(244, 63, 94, 0.85)',
+      borderColor: '#f43f5e',
+      borderWidth: 1,
+      barThickness: 3,
       yAxisID: 'yLoss',
       order: 1,
     });
@@ -270,14 +317,28 @@ function renderTargetList() {
   elTargetCount.textContent = String(state.targets.length);
   elTargetList.innerHTML = '';
 
+  // Also keep target filter dropdown in Packet Loss Log synced
+  const prevFilter = elSelectLossTargetFilter.value;
+  elSelectLossTargetFilter.innerHTML = '<option value="">All Targets</option>';
+
+  let totalLostAcrossTargets = 0;
+
   for (const t of state.targets) {
+    const opt = document.createElement('option');
+    opt.value = String(t.id);
+    opt.textContent = `${t.label} (${t.host})`;
+    elSelectLossTargetFilter.appendChild(opt);
+
+    totalLostAcrossTargets += Number(t.lost_count || 0);
+
     const isSelected = t.id === state.selectedTargetId;
     const status = getTargetStatus(t);
     const pingText =
       t.current_ms !== null && t.current_ms !== undefined
         ? `${Number(t.current_ms).toFixed(1)} ms`
         : '--';
-    const loss1h = Number(t.loss_1h_pct || 0).toFixed(1);
+    const totalLoss = Number(t.loss_pct ?? t.loss_1h_pct ?? 0).toFixed(1);
+    const lostCnt = Number(t.lost_count || 0);
 
     const item = document.createElement('div');
     item.className = `px-3 py-2.5 cursor-pointer transition border-l-2 ${
@@ -285,7 +346,10 @@ function renderTargetList() {
         ? 'bg-slate-850 border-cyan-400'
         : 'border-transparent hover:bg-slate-900/60'
     }`;
-    item.onclick = () => selectTarget(t.id);
+    item.onclick = () => {
+      selectTarget(t.id);
+      if (state.activeTab !== 'live') switchTab('live');
+    };
 
     item.innerHTML = `
       <div class="flex items-center justify-between">
@@ -297,10 +361,21 @@ function renderTargetList() {
       </div>
       <div class="flex items-center justify-between text-[11px] font-mono text-slate-500 mt-0.5 pl-4">
         <span class="truncate">${escapeHtml(t.host)}</span>
-        <span class="${Number(loss1h) >= 1 ? 'text-rose-400' : 'text-slate-500'}">${loss1h}%</span>
+        <span class="${lostCnt > 0 ? 'text-rose-400' : 'text-slate-500'}">
+          ${totalLoss}%${lostCnt > 0 ? ` (${lostCnt} lost)` : ''}
+        </span>
       </div>
     `;
     elTargetList.appendChild(item);
+  }
+
+  elSelectLossTargetFilter.value = prevFilter;
+
+  if (totalLostAcrossTargets > 0) {
+    elLossLogBadge.textContent = String(totalLostAcrossTargets);
+    elLossLogBadge.classList.remove('hidden');
+  } else {
+    elLossLogBadge.classList.add('hidden');
   }
 
   updateSelectedTargetHeader();
@@ -322,7 +397,6 @@ function updateSelectedTargetHeader() {
   elActiveLabel.textContent = target.label;
   elActiveHost.textContent = target.host !== target.label ? target.host : '';
 
-  // Sync interval selector dropdown
   const intervalVal = String(Number(target.interval_sec));
   if ([...elSelectInterval.options].some((o) => o.value === intervalVal)) {
     elSelectInterval.value = intervalVal;
@@ -335,9 +409,12 @@ function updateSelectedTargetHeader() {
     elSelectInterval.value = intervalVal;
   }
 
+  const totalLoss = Number(target.loss_pct ?? target.loss_1h_pct ?? 0).toFixed(1);
+  const lostCnt = Number(target.lost_count || 0);
+
   elHeaderPing.textContent = formatMs(target.current_ms);
   elHeaderJitter.textContent = formatMs(target.jitter_ms);
-  elHeaderLoss.textContent = `${Number(target.loss_1h_pct || 0).toFixed(1)}%`;
+  elHeaderLoss.textContent = lostCnt > 0 ? `${totalLoss}% (${lostCnt})` : `${totalLoss}%`;
   elBtnTogglePauseText.textContent = target.enabled ? 'Pause' : 'Resume';
 }
 
@@ -356,7 +433,7 @@ function buildSparklineSvg(sparkline, scaleMaxMs) {
     const x = Math.round(idx * step + step / 2);
     if (val === null || val === undefined) {
       lossBars.push(
-        `<rect x="${x - 1}" y="2" width="2.5" height="${height - 4}" fill="#f43f5e" opacity="0.85" />`
+        `<rect x="${x - 1}" y="2" width="2.5" height="${height - 4}" fill="#f43f5e" opacity="0.9" />`
       );
     } else {
       const clamped = Math.min(1, Math.max(0.06, Number(val) / Math.max(10, scaleMaxMs)));
@@ -409,7 +486,7 @@ function renderHopTable() {
   if (hops.length === 0) {
     elHopTableBody.innerHTML = `
       <tr>
-        <td colspan="11" class="py-8 text-center text-slate-500 font-sans text-xs">
+        <td colspan="12" class="py-8 text-center text-slate-500 font-sans text-xs">
           Tracing route hops...
         </td>
       </tr>
@@ -425,7 +502,9 @@ function renderHopTable() {
     const isFinal = h.hop_num === finalHopNum;
     const isPlotted = plottedSet.has(h.hop_num);
     const hopColor = colorForHop(h.hop_num, isFinal);
-    const lossVal = Number(h.rolling_loss_pct || 0);
+    // Use total session loss_pct so packet loss never disappears after 100 seconds
+    const lossVal = Number(h.loss_pct || 0);
+    const lostCnt = Number(h.lost || 0);
 
     const rdnsDisplay =
       h.rdns_hostname && h.rdns_hostname !== h.ip_address && h.rdns_hostname !== '???'
@@ -457,10 +536,13 @@ function renderHopTable() {
       }">
         ${h.ip_address === '???' ? '--' : `${lossVal.toFixed(1)}%`}
       </td>
+      <td class="py-1.5 px-2 text-right ${lostCnt > 0 ? 'text-rose-400 font-semibold' : 'text-slate-500'}">
+        ${lostCnt}
+      </td>
       <td class="py-1.5 px-2 text-right text-slate-400">${h.sent}</td>
       <td class="py-1.5 px-2 text-right ${
-        h.last_ms !== null ? 'text-slate-100' : 'text-slate-600'
-      }">${h.last_ms !== null ? h.last_ms.toFixed(1) : '--'}</td>
+        h.last_ms !== null ? 'text-slate-100' : 'text-rose-400'
+      }">${h.last_ms !== null ? h.last_ms.toFixed(1) : 'LOST'}</td>
       <td class="py-1.5 px-2 text-right text-slate-400">${
         h.avg_ms !== null ? h.avg_ms.toFixed(1) : '--'
       }</td>
@@ -491,6 +573,94 @@ function renderHopTable() {
     });
 
     elHopTableBody.appendChild(tr);
+  }
+}
+
+// ============================================================================
+// Packet Loss Log View
+// ============================================================================
+async function loadLossLog() {
+  const windowSec = Number(elSelectLossWindowFilter.value || 86400);
+  const targetFilter = elSelectLossTargetFilter.value;
+  const qs = new URLSearchParams({ window: String(windowSec) });
+  if (targetFilter) qs.set('target_id', targetFilter);
+
+  try {
+    const res = await fetch(`/api/loss-events?${qs.toString()}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    renderLossLogTable(data);
+  } catch (err) {
+    console.error('Failed loading loss events:', err);
+  }
+}
+
+function renderLossLogTable(data) {
+  const events = data.events || [];
+  const summary = data.summary || { total_incidents: 0, total_packets_lost: 0 };
+
+  elLossLogTotalIncidents.textContent = String(summary.total_incidents || 0);
+  elLossLogTotalPackets.textContent = String(summary.total_packets_lost || 0);
+  elLossLogTableBody.innerHTML = '';
+
+  if (events.length === 0) {
+    elLossLogTableBody.innerHTML = `
+      <tr>
+        <td colspan="6" class="py-12 text-center text-slate-500 font-sans text-xs">
+          No packet loss events recorded in this time window.
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  for (const ev of events) {
+    const d = new Date(ev.start_ts * 1000);
+    const timeStr = d.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+
+    let causeClass = 'text-slate-300 bg-slate-900 border-slate-700';
+    if (ev.severity === 'router') {
+      causeClass = 'text-amber-300 bg-amber-950/60 border-amber-800/70';
+    } else if (ev.severity === 'isp') {
+      causeClass = 'text-purple-300 bg-purple-950/60 border-purple-800/70';
+    } else if (ev.severity === 'target') {
+      causeClass = 'text-rose-300 bg-rose-950/60 border-rose-800/70';
+    }
+
+    const durationSec = Math.max(1, ev.end_ts - ev.start_ts + 1);
+    const tr = document.createElement('tr');
+    tr.className = 'hover:bg-slate-900/60 transition cursor-pointer';
+    tr.onclick = () => {
+      selectTarget(ev.target_id);
+      switchTab('live');
+    };
+
+    tr.innerHTML = `
+      <td class="py-2 px-4 text-slate-200">${escapeHtml(timeStr)}</td>
+      <td class="py-2 px-3 text-slate-500">${formatRelativeAgo(ev.start_ts)}</td>
+      <td class="py-2 px-3">
+        <span class="text-slate-100 font-sans font-medium">${escapeHtml(ev.target_label)}</span>
+        <span class="text-slate-500 ml-1">(${escapeHtml(ev.target_host)})</span>
+      </td>
+      <td class="py-2 px-3">
+        <span class="px-2 py-0.5 rounded border text-[11px] font-sans ${causeClass}">
+          ${escapeHtml(ev.cause)}
+        </span>
+      </td>
+      <td class="py-2 px-3 text-right text-rose-400 font-semibold">
+        ${ev.packets_lost} pkt${ev.packets_lost > 1 ? `s (${durationSec}s)` : ''}
+      </td>
+      <td class="py-2 px-4 text-slate-400 truncate max-w-md">
+        ${escapeHtml((ev.hops || []).join(', '))}
+      </td>
+    `;
+    elLossLogTableBody.appendChild(tr);
   }
 }
 
@@ -588,7 +758,9 @@ function handleWsMessage(msg) {
       targetObj.avg_ms = msg.summary.avg_ms;
       targetObj.jitter_ms = msg.summary.jitter_ms;
       targetObj.rolling_loss_pct = msg.summary.rolling_loss_pct;
-      targetObj.loss_1h_pct = msg.summary.rolling_loss_pct;
+      targetObj.loss_pct = msg.summary.loss_pct;
+      targetObj.loss_1h_pct = msg.summary.loss_pct;
+      targetObj.lost_count = msg.summary.lost_count;
       targetObj.hop_count = msg.summary.hop_count;
     }
     renderTargetList();
@@ -610,7 +782,9 @@ function handleWsMessage(msg) {
         }
       }
       renderHopTable();
-      renderTimelineChart();
+      if (state.activeTab === 'live') {
+        renderTimelineChart();
+      }
     }
   }
 }
@@ -619,6 +793,13 @@ function handleWsMessage(msg) {
 // Event Listeners
 // ============================================================================
 function bindEvents() {
+  elTabBtnLive.addEventListener('click', () => switchTab('live'));
+  elTabBtnLossLog.addEventListener('click', () => switchTab('losslog'));
+
+  elSelectLossTargetFilter.addEventListener('change', loadLossLog);
+  elSelectLossWindowFilter.addEventListener('change', loadLossLog);
+  document.getElementById('btnRefreshLossLog').addEventListener('click', loadLossLog);
+
   document.querySelectorAll('.time-window-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.time-window-btn').forEach((b) => {
@@ -635,7 +816,6 @@ function bindEvents() {
     if (state.chart) state.chart.resetZoom();
   });
 
-  // Live Adjustable Interval Dropdown
   elSelectInterval.addEventListener('change', async (e) => {
     const target = state.targets.find((t) => t.id === state.selectedTargetId);
     if (!target) return;
