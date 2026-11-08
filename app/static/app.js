@@ -343,7 +343,7 @@ function renderTargetList() {
     const lostCnt = Number(t.lost_count || 0);
 
     const item = document.createElement('div');
-    item.className = `px-3 py-2.5 cursor-pointer transition border-l-2 ${
+    item.className = `px-3 py-2 cursor-pointer transition shrink-0 min-w-[170px] xl:min-w-0 border-b-2 xl:border-b-0 xl:border-l-2 ${
       isSelected
         ? 'bg-slate-850 border-cyan-400'
         : 'border-transparent hover:bg-slate-900/60'
@@ -354,17 +354,17 @@ function renderTargetList() {
     };
 
     item.innerHTML = `
-      <div class="flex items-center justify-between">
+      <div class="flex items-center justify-between gap-2 whitespace-nowrap">
         <div class="flex items-center space-x-2 min-w-0">
           <span class="w-2 h-2 rounded-full ${status.color} shrink-0"></span>
           <span class="font-medium text-xs text-slate-100 truncate">${escapeHtml(t.label)}</span>
         </div>
-        <span class="text-xs font-mono text-slate-200">${pingText}</span>
+        <span class="text-xs font-mono text-slate-200 shrink-0">${pingText}</span>
       </div>
-      <div class="flex items-center justify-between text-[11px] font-mono text-slate-500 mt-0.5 pl-4">
-        <span class="truncate">${escapeHtml(t.host)}</span>
-        <span class="${lostCnt > 0 ? 'text-rose-400' : 'text-slate-500'}">
-          ${totalLoss}%${lostCnt > 0 ? ` (${lostCnt} lost)` : ''}
+      <div class="flex items-center justify-between gap-2 text-[11px] font-mono text-slate-500 mt-0.5 pl-4 whitespace-nowrap">
+        <span class="truncate max-w-[110px]">${escapeHtml(t.host)}</span>
+        <span class="shrink-0 ${lostCnt > 0 ? 'text-rose-400' : 'text-slate-500'}">
+          ${totalLoss}%${lostCnt > 0 ? ` (${lostCnt})` : ''}
         </span>
       </div>
     `;
@@ -534,7 +534,7 @@ function renderHopTable() {
     }
 
     tr.innerHTML = `
-      <td class="py-1.5 px-3 text-center">
+      <td class="py-1.5 px-2.5 text-center">
         <input type="checkbox" ${isPlotted ? 'checked' : ''}
                style="accent-color: ${hopColor}"
                class="w-3.5 h-3.5 rounded cursor-pointer"
@@ -543,7 +543,7 @@ function renderHopTable() {
       <td class="py-1.5 px-2 ${isFinal ? 'text-cyan-400 font-semibold' : 'text-slate-500'}">
         ${h.hop_num}
       </td>
-      <td class="py-1.5 px-3 truncate max-w-xs">${rdnsDisplay}</td>
+      <td class="py-1.5 px-3 truncate max-w-[180px] sm:max-w-[260px] lg:max-w-sm">${rdnsDisplay}</td>
       <td class="py-1.5 px-2 text-right ${lossTextClass}"
           title="${!carriedOver && lossVal > 0 ? 'Hop ignored ping, but 0% loss reached final destination' : ''}">
         ${h.ip_address === '???' ? '--' : `${lossVal.toFixed(1)}%`}
@@ -553,24 +553,24 @@ function renderHopTable() {
       }">
         ${lostCnt}
       </td>
-      <td class="py-1.5 px-2 text-right text-slate-400">${h.sent}</td>
+      <td class="py-1.5 px-2 text-right text-slate-400 hidden sm:table-cell">${h.sent}</td>
       <td class="py-1.5 px-2 text-right ${
         h.last_ms !== null ? 'text-slate-100' : 'text-rose-400'
       }">${h.last_ms !== null ? h.last_ms.toFixed(1) : 'LOST'}</td>
       <td class="py-1.5 px-2 text-right text-slate-400">${
         h.avg_ms !== null ? h.avg_ms.toFixed(1) : '--'
       }</td>
-      <td class="py-1.5 px-2 text-right text-slate-400">${
+      <td class="py-1.5 px-2 text-right text-slate-400 hidden md:table-cell">${
         h.min_ms !== null ? h.min_ms.toFixed(1) : '--'
       }</td>
-      <td class="py-1.5 px-2 text-right text-slate-400">${
+      <td class="py-1.5 px-2 text-right text-slate-400 hidden md:table-cell">${
         h.max_ms !== null ? h.max_ms.toFixed(1) : '--'
       }</td>
       <td class="py-1.5 px-2 text-right text-slate-400">${
         h.jitter_ms !== null ? h.jitter_ms.toFixed(1) : '0.0'
       }</td>
-      <td class="py-1.5 px-4">
-        <div class="flex items-center space-x-3">
+      <td class="py-1.5 px-3">
+        <div class="flex items-center space-x-2.5">
           ${buildLatencyRangeBar(h, scaleMaxMs)}
           ${buildSparklineSvg(h.sparkline, scaleMaxMs)}
         </div>
