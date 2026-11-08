@@ -436,13 +436,14 @@ def get_target_history(
 def get_loss_events(
     window_seconds: int = 86400,
     target_id: Optional[int] = None,
+    include_hop_only: bool = False,
     limit: int = 300,
 ) -> Dict[str, Any]:
     """
     Build a chronological log of Packet Loss incidents across targets.
-    Groups consecutive lost ticks (within 4 seconds) on the same target into a single
-    incident and identifies whether the drop started at the Local Router (Hop 1),
-    ISP (Hop 2-3), or the Destination/Game Server.
+     Distinguishes between:
+    - REAL destination packet loss (final hop dropped -> actual lag/connection loss)
+    - Harmless hop-only ICMP ignores (intermediate router ignored ping, but final destination succeeded)
     """
     now = int(time.time())
     since_ts = now - window_seconds
@@ -452,12 +453,18 @@ def get_loss_events(
         target_map = {r["id"]: {"host": r["host"], "label": r["label"]} for r in targets_rows}
 
         if not target_map:
-            return {"events": [], "summary": {"total_incidents": 0, "total_packets_lost": 0}}
+            return {
+                "events": [],
+                "summary": {
+                    "total_incidents": 0,
+                    "total_packets_lost": 0,
+                    "hop_only_ignored": 0,
+                },
+            }
 
-        # Get current max hop per target from hop_state so we know which hop is the final destination
         final_hops_rows = conn.execute(
             """
-            SELECT target_id, MAX(hop_num) AS max_hop, ip_address
+            SELECT target_id, MAX(hop_num) AS max_hop
             FROM hop_state
             GROUP BY target_id
             """
@@ -469,7 +476,6 @@ def get_loss_events(
         if target_id is not None:
             params.append(target_id)
 
-        # Fetch all timestamps where at least one hop (excluding '???') had packet loss
         loss_rows = conn.execute(
             f"""
             SELECT target_id, timestamp, hop_num, ip_address, rdns_hostname
@@ -479,12 +485,11 @@ def get_loss_events(
               AND timestamp >= ?
               {target_filter_sql}
             ORDER BY timestamp DESC, target_id ASC, hop_num ASC
-            LIMIT 4000
+            LIMIT 5000
             """,
             params,
         ).fetchall()
 
-    # Group by (target_id, timestamp) first
     ticks_by_target: Dict[int, Dict[int, List[Dict[str, Any]]]] = {}
     for r in loss_rows:
         t_id = r["target_id"]
@@ -500,7 +505,8 @@ def get_loss_events(
         )
 
     incidents: List[Dict[str, Any]] = []
-    total_packets_lost = 0
+    total_real_packets_lost = 0
+    hop_only_ignored_count = 0
 
     for t_id, ts_map in ticks_by_target.items():
         t_meta = target_map[t_id]
@@ -514,29 +520,43 @@ def get_loss_events(
             final_dropped = max_hop in hop_nums
             min_hop = min(hop_nums)
 
-            # Determine root cause for this tick
-            if 1 in hop_nums and max_hop > 1:
-                cause = "Local Router (Hop #1)"
-                severity = "router"
-            elif any(h in (2, 3) for h in hop_nums) and max_hop > 3:
-                cause = f"ISP Network (Hop #{min_hop})"
-                severity = "isp"
-            elif final_dropped:
-                cause = "Target / Game Server"
-                severity = "target"
+            if not final_dropped:
+                hop_only_ignored_count += 1
+                if not include_hop_only:
+                    continue
+                impact = "No Impact (Destination OK)"
+                cause = f"Hop #{min_hop} Ignored Ping"
+                severity = "harmless"
             else:
-                cause = f"Route Hop #{min_hop}"
-                severity = "route"
+                total_real_packets_lost += 1
+                impact = "Real Packet Loss"
+                # Since the final destination dropped, check if an upstream hop dropped at the same second
+                if 1 in hop_nums and max_hop > 1:
+                    cause = "Local Router + Destination"
+                    severity = "router"
+                elif any(h in (2, 3) for h in hop_nums) and max_hop > 3:
+                    cause = f"ISP Hop #{min_hop} + Destination"
+                    severity = "isp"
+                elif min_hop < max_hop:
+                    cause = f"Hop #{min_hop} -> Destination"
+                    severity = "route"
+                else:
+                    cause = "Final Destination Only"
+                    severity = "target"
 
             hop_labels = [
                 f"#{h['hop_num']} ({h['rdns_hostname'] if h['rdns_hostname'] != '???' else h['ip_address']})"
                 for h in dropped_hops
             ]
 
-            if current_inc and (ts - current_inc["end_ts"] <= 4) and current_inc["cause"] == cause:
+            if (
+                current_inc
+                and (ts - current_inc["end_ts"] <= 4)
+                and current_inc["cause"] == cause
+                and current_inc["final_dropped"] == final_dropped
+            ):
                 current_inc["end_ts"] = ts
                 current_inc["packets_lost"] += 1
-                current_inc["final_dropped"] = current_inc["final_dropped"] or final_dropped
                 for lbl in hop_labels:
                     if lbl not in current_inc["hops"]:
                         current_inc["hops"].append(lbl)
@@ -551,11 +571,11 @@ def get_loss_events(
                     "end_ts": ts,
                     "packets_lost": 1,
                     "final_dropped": final_dropped,
+                    "impact": impact,
                     "cause": cause,
                     "severity": severity,
                     "hops": hop_labels,
                 }
-            total_packets_lost += 1
 
         if current_inc:
             incidents.append(current_inc)
@@ -566,8 +586,9 @@ def get_loss_events(
     return {
         "events": incidents,
         "summary": {
-            "total_incidents": len(incidents),
-            "total_packets_lost": total_packets_lost,
+            "total_incidents": sum(1 for i in incidents if i["final_dropped"]),
+            "total_packets_lost": total_real_packets_lost,
+            "hop_only_ignored": hop_only_ignored_count,
         },
     }
 

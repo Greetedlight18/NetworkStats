@@ -54,6 +54,8 @@ const elViewLossLog = document.getElementById('viewLossLog');
 const elLossLogTableBody = document.getElementById('lossLogTableBody');
 const elLossLogTotalIncidents = document.getElementById('lossLogTotalIncidents');
 const elLossLogTotalPackets = document.getElementById('lossLogTotalPackets');
+const elLossLogHarmlessCount = document.getElementById('lossLogHarmlessCount');
+const elChkIncludeHopOnly = document.getElementById('chkIncludeHopOnly');
 const elSelectLossTargetFilter = document.getElementById('selectLossTargetFilter');
 const elSelectLossWindowFilter = document.getElementById('selectLossWindowFilter');
 
@@ -495,16 +497,20 @@ function renderHopTable() {
   }
 
   const plottedSet = getPlottedSet(targetId, hops);
-  const finalHopNum = hops[hops.length - 1].hop_num;
+  const finalHop = hops[hops.length - 1];
+  const finalHopNum = finalHop.hop_num;
+  const finalLossVal = Number(finalHop.loss_pct || 0);
   const scaleMaxMs = Math.max(25, ...hops.map((h) => Number(h.max_ms || 0)));
 
   for (const h of hops) {
     const isFinal = h.hop_num === finalHopNum;
     const isPlotted = plottedSet.has(h.hop_num);
     const hopColor = colorForHop(h.hop_num, isFinal);
-    // Use total session loss_pct so packet loss never disappears after 100 seconds
     const lossVal = Number(h.loss_pct || 0);
     const lostCnt = Number(h.lost || 0);
+    // If an intermediate hop drops pings, but the final destination has 0% loss,
+    // it's just that router ignoring ICMP (did NOT carry over to destination)
+    const carriedOver = isFinal || finalLossVal > 0;
 
     const rdnsDisplay =
       h.rdns_hostname && h.rdns_hostname !== h.ip_address && h.rdns_hostname !== '???'
@@ -515,6 +521,17 @@ function renderHopTable() {
 
     const tr = document.createElement('tr');
     tr.className = `hover:bg-slate-900/60 transition ${isFinal ? 'bg-cyan-950/10' : ''}`;
+
+    let lossTextClass = 'text-slate-400';
+    if (lossVal > 0 && h.ip_address !== '???') {
+      if (!carriedOver) {
+        lossTextClass = 'text-slate-500';
+      } else if (lossVal >= 5) {
+        lossTextClass = 'text-rose-400 font-semibold';
+      } else {
+        lossTextClass = 'text-amber-400';
+      }
+    }
 
     tr.innerHTML = `
       <td class="py-1.5 px-3 text-center">
@@ -527,16 +544,13 @@ function renderHopTable() {
         ${h.hop_num}
       </td>
       <td class="py-1.5 px-3 truncate max-w-xs">${rdnsDisplay}</td>
-      <td class="py-1.5 px-2 text-right ${
-        lossVal >= 5 && h.ip_address !== '???'
-          ? 'text-rose-400 font-semibold'
-          : lossVal > 0 && h.ip_address !== '???'
-          ? 'text-amber-400'
-          : 'text-slate-400'
-      }">
+      <td class="py-1.5 px-2 text-right ${lossTextClass}"
+          title="${!carriedOver && lossVal > 0 ? 'Hop ignored ping, but 0% loss reached final destination' : ''}">
         ${h.ip_address === '???' ? '--' : `${lossVal.toFixed(1)}%`}
       </td>
-      <td class="py-1.5 px-2 text-right ${lostCnt > 0 ? 'text-rose-400 font-semibold' : 'text-slate-500'}">
+      <td class="py-1.5 px-2 text-right ${
+        lostCnt > 0 ? (carriedOver ? 'text-rose-400 font-semibold' : 'text-slate-500') : 'text-slate-500'
+      }">
         ${lostCnt}
       </td>
       <td class="py-1.5 px-2 text-right text-slate-400">${h.sent}</td>
@@ -582,7 +596,11 @@ function renderHopTable() {
 async function loadLossLog() {
   const windowSec = Number(elSelectLossWindowFilter.value || 86400);
   const targetFilter = elSelectLossTargetFilter.value;
-  const qs = new URLSearchParams({ window: String(windowSec) });
+  const includeHopOnly = elChkIncludeHopOnly && elChkIncludeHopOnly.checked;
+  const qs = new URLSearchParams({
+    window: String(windowSec),
+    include_hop_only: includeHopOnly ? 'true' : 'false',
+  });
   if (targetFilter) qs.set('target_id', targetFilter);
 
   try {
@@ -597,17 +615,24 @@ async function loadLossLog() {
 
 function renderLossLogTable(data) {
   const events = data.events || [];
-  const summary = data.summary || { total_incidents: 0, total_packets_lost: 0 };
+  const summary = data.summary || {
+    total_incidents: 0,
+    total_packets_lost: 0,
+    hop_only_ignored: 0,
+  };
 
   elLossLogTotalIncidents.textContent = String(summary.total_incidents || 0);
   elLossLogTotalPackets.textContent = String(summary.total_packets_lost || 0);
+  if (elLossLogHarmlessCount) {
+    elLossLogHarmlessCount.textContent = String(summary.hop_only_ignored || 0);
+  }
   elLossLogTableBody.innerHTML = '';
 
   if (events.length === 0) {
     elLossLogTableBody.innerHTML = `
       <tr>
-        <td colspan="6" class="py-12 text-center text-slate-500 font-sans text-xs">
-          No packet loss events recorded in this time window.
+        <td colspan="7" class="py-12 text-center text-slate-500 font-sans text-xs">
+          Zero real destination packet loss recorded in this time window! (Check "Show harmless hop-only ignores" above if you want to see intermediate router ICMP ignores).
         </td>
       </tr>
     `;
@@ -624,6 +649,11 @@ function renderLossLogTable(data) {
       second: '2-digit',
     });
 
+    const isReal = Boolean(ev.final_dropped);
+    const impactBadge = isReal
+      ? `<span class="px-2 py-0.5 rounded border text-[11px] font-sans text-rose-300 bg-rose-950/70 border-rose-800 font-medium">Real Loss (Reached Target)</span>`
+      : `<span class="px-2 py-0.5 rounded border text-[11px] font-sans text-slate-400 bg-slate-900 border-slate-800">No Impact (Target OK)</span>`;
+
     let causeClass = 'text-slate-300 bg-slate-900 border-slate-700';
     if (ev.severity === 'router') {
       causeClass = 'text-amber-300 bg-amber-950/60 border-amber-800/70';
@@ -631,6 +661,8 @@ function renderLossLogTable(data) {
       causeClass = 'text-purple-300 bg-purple-950/60 border-purple-800/70';
     } else if (ev.severity === 'target') {
       causeClass = 'text-rose-300 bg-rose-950/60 border-rose-800/70';
+    } else if (ev.severity === 'harmless') {
+      causeClass = 'text-slate-400 bg-slate-900 border-slate-800';
     }
 
     const durationSec = Math.max(1, ev.end_ts - ev.start_ts + 1);
@@ -646,14 +678,14 @@ function renderLossLogTable(data) {
       <td class="py-2 px-3 text-slate-500">${formatRelativeAgo(ev.start_ts)}</td>
       <td class="py-2 px-3">
         <span class="text-slate-100 font-sans font-medium">${escapeHtml(ev.target_label)}</span>
-        <span class="text-slate-500 ml-1">(${escapeHtml(ev.target_host)})</span>
       </td>
+      <td class="py-2 px-3">${impactBadge}</td>
       <td class="py-2 px-3">
         <span class="px-2 py-0.5 rounded border text-[11px] font-sans ${causeClass}">
           ${escapeHtml(ev.cause)}
         </span>
       </td>
-      <td class="py-2 px-3 text-right text-rose-400 font-semibold">
+      <td class="py-2 px-3 text-right ${isReal ? 'text-rose-400 font-semibold' : 'text-slate-500'}">
         ${ev.packets_lost} pkt${ev.packets_lost > 1 ? `s (${durationSec}s)` : ''}
       </td>
       <td class="py-2 px-4 text-slate-400 truncate max-w-md">
@@ -798,6 +830,7 @@ function bindEvents() {
 
   elSelectLossTargetFilter.addEventListener('change', loadLossLog);
   elSelectLossWindowFilter.addEventListener('change', loadLossLog);
+  if (elChkIncludeHopOnly) elChkIncludeHopOnly.addEventListener('change', loadLossLog);
   document.getElementById('btnRefreshLossLog').addEventListener('click', loadLossLog);
 
   document.querySelectorAll('.time-window-btn').forEach((btn) => {
