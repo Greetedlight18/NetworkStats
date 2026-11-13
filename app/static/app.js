@@ -1,5 +1,5 @@
 /**
- * NetworkStats — Clean Real-Time UI & Packet Loss Log Controller
+ * NetworkStats — Real-Time UI & Packet Loss Log Controller
  */
 
 const HOP_PALETTE = [
@@ -16,7 +16,7 @@ const HOP_PALETTE = [
 ];
 
 const state = {
-  activeTab: 'live', // 'live' | 'losslog'
+  activeTab: 'live',
   targets: [],
   selectedTargetId: null,
   hopsByTarget: {},
@@ -54,8 +54,6 @@ const elViewLossLog = document.getElementById('viewLossLog');
 const elLossLogTableBody = document.getElementById('lossLogTableBody');
 const elLossLogTotalIncidents = document.getElementById('lossLogTotalIncidents');
 const elLossLogTotalPackets = document.getElementById('lossLogTotalPackets');
-const elLossLogHarmlessCount = document.getElementById('lossLogHarmlessCount');
-const elChkIncludeHopOnly = document.getElementById('chkIncludeHopOnly');
 const elSelectLossTargetFilter = document.getElementById('selectLossTargetFilter');
 const elSelectLossWindowFilter = document.getElementById('selectLossWindowFilter');
 
@@ -113,18 +111,18 @@ function formatRelativeAgo(unixSec) {
 function switchTab(tabName) {
   state.activeTab = tabName;
   if (tabName === 'live') {
-    elTabBtnLive.className = 'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white transition';
+    elTabBtnLive.className = 'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white whitespace-nowrap transition';
     elTabBtnLossLog.className =
-      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 transition';
+      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 whitespace-nowrap transition';
     elViewLive.classList.remove('hidden');
     elViewLossLog.classList.add('hidden');
     elViewLossLog.classList.remove('flex');
     renderTimelineChart();
   } else {
     elTabBtnLossLog.className =
-      'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white flex items-center space-x-1.5 transition';
+      'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white flex items-center space-x-1.5 whitespace-nowrap transition';
     elTabBtnLive.className =
-      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 transition';
+      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 whitespace-nowrap transition';
     elViewLive.classList.add('hidden');
     elViewLossLog.classList.remove('hidden');
     elViewLossLog.classList.add('flex');
@@ -238,9 +236,6 @@ function renderTimelineChart() {
   const plottedSet = getPlottedSet(state.selectedTargetId, hops);
   const plottedHops = Array.from(plottedSet).sort((a, b) => a - b);
 
-  elPlottedSummary.textContent =
-    plottedHops.length > 0 ? `Hop ${plottedHops.map((h) => `#${h}`).join(', ')}` : '';
-
   const tsSet = new Set();
   for (const hNum of plottedHops) {
     for (const pt of state.historySeries[String(hNum)] || []) {
@@ -285,19 +280,25 @@ function renderTimelineChart() {
     });
   }
 
-  // Fixed 3px barThickness + null for 0% loss so red spikes stay visible on 15m/1h/6h/24h!
+  let lossSpikesInWindow = 0;
   if (primaryHop !== undefined) {
     const ptMap = new Map();
     for (const pt of state.historySeries[String(primaryHop)] || []) {
       ptMap.set(pt.ts, pt);
     }
+    const lossData = sortedTs.map((ts) => {
+      const item = ptMap.get(ts);
+      if (item && item.loss > 0) {
+        lossSpikesInWindow += 1;
+        return item.loss;
+      }
+      return null;
+    });
+
     datasets.push({
       type: 'bar',
       label: 'Packet Loss',
-      data: sortedTs.map((ts) => {
-        const item = ptMap.get(ts);
-        return item && item.loss > 0 ? item.loss : null;
-      }),
+      data: lossData,
       backgroundColor: 'rgba(244, 63, 94, 0.85)',
       borderColor: '#f43f5e',
       borderWidth: 1,
@@ -305,6 +306,14 @@ function renderTimelineChart() {
       yAxisID: 'yLoss',
       order: 1,
     });
+  }
+
+  if (plottedHops.length > 0) {
+    const hopStr = `Hop ${plottedHops.map((h) => `#${h}`).join(', ')}`;
+    elPlottedSummary.textContent =
+      lossSpikesInWindow > 0 ? `${hopStr} • ${lossSpikesInWindow} loss spike(s) in window` : hopStr;
+  } else {
+    elPlottedSummary.textContent = '';
   }
 
   state.chart.data.labels = labels;
@@ -319,7 +328,6 @@ function renderTargetList() {
   elTargetCount.textContent = String(state.targets.length);
   elTargetList.innerHTML = '';
 
-  // Also keep target filter dropdown in Packet Loss Log synced
   const prevFilter = elSelectLossTargetFilter.value;
   elSelectLossTargetFilter.innerHTML = '<option value="">All Targets</option>';
 
@@ -339,7 +347,7 @@ function renderTargetList() {
       t.current_ms !== null && t.current_ms !== undefined
         ? `${Number(t.current_ms).toFixed(1)} ms`
         : '--';
-    const totalLoss = Number(t.loss_pct ?? t.loss_1h_pct ?? 0).toFixed(1);
+    const totalLoss = Number(t.loss_pct ?? t.loss_1h_pct ?? 0).toFixed(2);
     const lostCnt = Number(t.lost_count || 0);
 
     const item = document.createElement('div');
@@ -374,7 +382,7 @@ function renderTargetList() {
   elSelectLossTargetFilter.value = prevFilter;
 
   if (totalLostAcrossTargets > 0) {
-    elLossLogBadge.textContent = String(totalLostAcrossTargets);
+    elLossLogBadge.textContent = `${totalLostAcrossTargets} pkt${totalLostAcrossTargets > 1 ? 's' : ''}`;
     elLossLogBadge.classList.remove('hidden');
   } else {
     elLossLogBadge.classList.add('hidden');
@@ -411,12 +419,12 @@ function updateSelectedTargetHeader() {
     elSelectInterval.value = intervalVal;
   }
 
-  const totalLoss = Number(target.loss_pct ?? target.loss_1h_pct ?? 0).toFixed(1);
+  const totalLoss = Number(target.loss_pct ?? target.loss_1h_pct ?? 0).toFixed(2);
   const lostCnt = Number(target.lost_count || 0);
 
   elHeaderPing.textContent = formatMs(target.current_ms);
   elHeaderJitter.textContent = formatMs(target.jitter_ms);
-  elHeaderLoss.textContent = lostCnt > 0 ? `${totalLoss}% (${lostCnt})` : `${totalLoss}%`;
+  elHeaderLoss.textContent = lostCnt > 0 ? `${totalLoss}% (${lostCnt} lost)` : `${totalLoss}%`;
   elBtnTogglePauseText.textContent = target.enabled ? 'Pause' : 'Resume';
 }
 
@@ -508,8 +516,6 @@ function renderHopTable() {
     const hopColor = colorForHop(h.hop_num, isFinal);
     const lossVal = Number(h.loss_pct || 0);
     const lostCnt = Number(h.lost || 0);
-    // If an intermediate hop drops pings, but the final destination has 0% loss,
-    // it's just that router ignoring ICMP (did NOT carry over to destination)
     const carriedOver = isFinal || finalLossVal > 0;
 
     const rdnsDisplay =
@@ -546,7 +552,7 @@ function renderHopTable() {
       <td class="py-1.5 px-3 truncate max-w-[180px] sm:max-w-[260px] lg:max-w-sm">${rdnsDisplay}</td>
       <td class="py-1.5 px-2 text-right ${lossTextClass}"
           title="${!carriedOver && lossVal > 0 ? 'Hop ignored ping, but 0% loss reached final destination' : ''}">
-        ${h.ip_address === '???' ? '--' : `${lossVal.toFixed(1)}%`}
+        ${h.ip_address === '???' ? '--' : `${lossVal.toFixed(2)}%`}
       </td>
       <td class="py-1.5 px-2 text-right ${
         lostCnt > 0 ? (carriedOver ? 'text-rose-400 font-semibold' : 'text-slate-500') : 'text-slate-500'
@@ -594,13 +600,9 @@ function renderHopTable() {
 // Packet Loss Log View
 // ============================================================================
 async function loadLossLog() {
-  const windowSec = Number(elSelectLossWindowFilter.value || 86400);
+  const windowSec = Number(elSelectLossWindowFilter.value || 0);
   const targetFilter = elSelectLossTargetFilter.value;
-  const includeHopOnly = elChkIncludeHopOnly && elChkIncludeHopOnly.checked;
-  const qs = new URLSearchParams({
-    window: String(windowSec),
-    include_hop_only: includeHopOnly ? 'true' : 'false',
-  });
+  const qs = new URLSearchParams({ window: String(windowSec) });
   if (targetFilter) qs.set('target_id', targetFilter);
 
   try {
@@ -618,21 +620,17 @@ function renderLossLogTable(data) {
   const summary = data.summary || {
     total_incidents: 0,
     total_packets_lost: 0,
-    hop_only_ignored: 0,
   };
 
   elLossLogTotalIncidents.textContent = String(summary.total_incidents || 0);
   elLossLogTotalPackets.textContent = String(summary.total_packets_lost || 0);
-  if (elLossLogHarmlessCount) {
-    elLossLogHarmlessCount.textContent = String(summary.hop_only_ignored || 0);
-  }
   elLossLogTableBody.innerHTML = '';
 
   if (events.length === 0) {
     elLossLogTableBody.innerHTML = `
       <tr>
-        <td colspan="7" class="py-12 text-center text-slate-500 font-sans text-xs">
-          Zero real destination packet loss recorded in this time window! (Check "Show harmless hop-only ignores" above if you want to see intermediate router ICMP ignores).
+        <td colspan="5" class="py-12 text-center text-slate-500 font-sans text-xs">
+          No packet loss recorded for this filter.
         </td>
       </tr>
     `;
@@ -649,20 +647,11 @@ function renderLossLogTable(data) {
       second: '2-digit',
     });
 
-    const isReal = Boolean(ev.final_dropped);
-    const impactBadge = isReal
-      ? `<span class="px-2 py-0.5 rounded border text-[11px] font-sans text-rose-300 bg-rose-950/70 border-rose-800 font-medium">Real Loss (Reached Target)</span>`
-      : `<span class="px-2 py-0.5 rounded border text-[11px] font-sans text-slate-400 bg-slate-900 border-slate-800">No Impact (Target OK)</span>`;
-
-    let causeClass = 'text-slate-300 bg-slate-900 border-slate-700';
+    let causeClass = 'text-rose-300 bg-rose-950/60 border-rose-800/70';
     if (ev.severity === 'router') {
       causeClass = 'text-amber-300 bg-amber-950/60 border-amber-800/70';
     } else if (ev.severity === 'isp') {
       causeClass = 'text-purple-300 bg-purple-950/60 border-purple-800/70';
-    } else if (ev.severity === 'target') {
-      causeClass = 'text-rose-300 bg-rose-950/60 border-rose-800/70';
-    } else if (ev.severity === 'harmless') {
-      causeClass = 'text-slate-400 bg-slate-900 border-slate-800';
     }
 
     const durationSec = Math.max(1, ev.end_ts - ev.start_ts + 1);
@@ -674,22 +663,19 @@ function renderLossLogTable(data) {
     };
 
     tr.innerHTML = `
-      <td class="py-2 px-4 text-slate-200">${escapeHtml(timeStr)}</td>
-      <td class="py-2 px-3 text-slate-500">${formatRelativeAgo(ev.start_ts)}</td>
-      <td class="py-2 px-3">
+      <td class="py-2.5 px-4 text-slate-200">${escapeHtml(timeStr)}</td>
+      <td class="py-2.5 px-3 text-slate-500">${formatRelativeAgo(ev.start_ts)}</td>
+      <td class="py-2.5 px-3">
         <span class="text-slate-100 font-sans font-medium">${escapeHtml(ev.target_label)}</span>
+        <span class="text-slate-500 ml-1">(${escapeHtml(ev.target_host)})</span>
       </td>
-      <td class="py-2 px-3">${impactBadge}</td>
-      <td class="py-2 px-3">
+      <td class="py-2.5 px-3 text-right text-rose-400 font-semibold">
+        ${ev.packets_lost} lost${durationSec > 1 ? ` (${durationSec}s)` : ''}
+      </td>
+      <td class="py-2.5 px-4">
         <span class="px-2 py-0.5 rounded border text-[11px] font-sans ${causeClass}">
           ${escapeHtml(ev.cause)}
         </span>
-      </td>
-      <td class="py-2 px-3 text-right ${isReal ? 'text-rose-400 font-semibold' : 'text-slate-500'}">
-        ${ev.packets_lost} pkt${ev.packets_lost > 1 ? `s (${durationSec}s)` : ''}
-      </td>
-      <td class="py-2 px-4 text-slate-400 truncate max-w-md">
-        ${escapeHtml((ev.hops || []).join(', '))}
       </td>
     `;
     elLossLogTableBody.appendChild(tr);
@@ -830,7 +816,6 @@ function bindEvents() {
 
   elSelectLossTargetFilter.addEventListener('change', loadLossLog);
   elSelectLossWindowFilter.addEventListener('change', loadLossLog);
-  if (elChkIncludeHopOnly) elChkIncludeHopOnly.addEventListener('change', loadLossLog);
   document.getElementById('btnRefreshLossLog').addEventListener('click', loadLossLog);
 
   document.querySelectorAll('.time-window-btn').forEach((btn) => {

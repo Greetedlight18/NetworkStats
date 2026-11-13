@@ -214,17 +214,12 @@ async def api_get_target_history(
 
 @app.get("/api/loss-events")
 async def api_get_loss_events(
-    window: int = Query(default=86400, ge=60, le=172800, description="Time window in seconds"),
+    window: int = Query(default=0, ge=0, le=2592000, description="Time window in seconds (0 = all time)"),
     target_id: Optional[int] = Query(default=None, description="Optional target ID filter"),
-    include_hop_only: bool = Query(
-        default=False,
-        description="Include intermediate hop timeouts that did not affect the final destination",
-    ),
 ):
     return database.get_loss_events(
         window_seconds=window,
         target_id=target_id,
-        include_hop_only=include_hop_only,
     )
 
 
