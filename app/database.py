@@ -1,15 +1,21 @@
+import asyncio
+import functools
+import ipaddress
 import json
 import logging
 import os
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("NetworkStats.database")
 
 DB_PATH = os.getenv("DB_PATH", "/data/networkstats.db")
-RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "168"))  # 7 days default retention
+RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "48"))
+LOSS_RETENTION_DAYS = int(os.getenv("LOSS_RETENTION_DAYS", "365"))
 DEFAULT_INTERVAL = float(os.getenv("PROBE_INTERVAL", "1.0"))
 
 DEFAULT_TARGETS = [
@@ -19,27 +25,268 @@ DEFAULT_TARGETS = [
     {"host": "9.9.9.9", "label": "Quad9 DNS", "interval_sec": DEFAULT_INTERVAL},
 ]
 
+_write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db-writer")
+_read_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="db-reader")
+_thread_local = threading.local()
+_conn_generation = 0
+
+
+def close_thread_connections() -> None:
+    """Invalidate all cached thread-local SQLite connections (e.g. when DB_PATH changes)."""
+    global _conn_generation
+    _conn_generation += 1
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _thread_local.conn = None
+
+
+async def run_db_write(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a serialized SQLite write operation off the asyncio event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_write_executor, functools.partial(fn, *args, **kwargs))
+
+
+async def run_db_read(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a SQLite read operation off the asyncio event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_read_executor, functools.partial(fn, *args, **kwargs))
+
+
+def _is_private_ip(ip_str: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip_str).is_private
+    except Exception:
+        return False
+
 
 @contextmanager
 def get_db_connection():
-    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
+    db_path = DB_PATH
+    gen = _conn_generation
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None and (
+        getattr(_thread_local, "db_path", None) != db_path
+        or getattr(_thread_local, "gen", None) != gen
+    ):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = None
+        _thread_local.conn = None
+
+    if conn is None:
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA busy_timeout=15000;")
+        conn.execute("PRAGMA wal_autocheckpoint=2000;")
+        _thread_local.conn = conn
+        _thread_local.db_path = db_path
+        _thread_local.gen = gen
+
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _thread_local.conn = None
         raise
-    finally:
-        conn.close()
+
+
+def _migrate_to_v2(conn: sqlite3.Connection) -> None:
+    """One-time migration: clean legacy 10.x intermediate hops and backfill loss_events."""
+    # 1. Clean bad intermediate hops from small hop_state table only (never full-scan DELETE hop_metrics)
+    conn.execute(
+        """
+        DELETE FROM hop_state
+        WHERE ip_address = '???'
+           OR (hop_num > 1 AND ip_address LIKE '10.%' AND ip_address != '10.0.0.1')
+        """
+    )
+
+    t_rows = conn.execute("SELECT id, host, label FROM targets ORDER BY id ASC").fetchall()
+    target_max_hop: Dict[int, int] = {}
+    target_meta: Dict[int, Dict[str, str]] = {}
+
+    for tr in t_rows:
+        t_id = tr["id"]
+        target_meta[t_id] = {"host": tr["host"], "label": tr["label"]}
+        hops = conn.execute(
+            "SELECT * FROM hop_state WHERE target_id = ? ORDER BY hop_num ASC",
+            (t_id,),
+        ).fetchall()
+        if not hops:
+            continue
+
+        # Renumber via temporary negative hop_num to guarantee zero PK collision
+        max_old_hop = hops[-1]["hop_num"]
+        new_max_hop = len(hops)
+        target_max_hop[t_id] = new_max_hop
+
+        for new_idx, h in enumerate(hops):
+            conn.execute(
+                "UPDATE hop_state SET hop_num = ? WHERE target_id = ? AND hop_num = ?",
+                (-(new_idx + 1), t_id, h["hop_num"]),
+            )
+
+        for new_idx, h in enumerate(hops):
+            new_hop_num = new_idx + 1
+            is_final = h["hop_num"] == max_old_hop
+            if is_final:
+                stat = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total_sent, COALESCE(SUM(is_loss), 0) AS total_lost
+                    FROM hop_metrics
+                    WHERE target_id = ? AND hop_num >= ?
+                      AND ip_address != '???'
+                      AND NOT (hop_num > 1 AND ip_address LIKE '10.%' AND ip_address != '10.0.0.1')
+                    """,
+                    (t_id, new_hop_num),
+                ).fetchone()
+            else:
+                stat = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total_sent, COALESCE(SUM(is_loss), 0) AS total_lost
+                    FROM hop_metrics
+                    WHERE target_id = ? AND ip_address = ?
+                    """,
+                    (t_id, h["ip_address"]),
+                ).fetchone()
+
+            s_cnt = int(stat["total_sent"]) if (stat and stat["total_sent"]) else int(h["sent"])
+            l_cnt = int(stat["total_lost"]) if (stat and stat["total_sent"]) else int(h["lost"])
+            l_pct = round((l_cnt / s_cnt) * 100.0, 2) if s_cnt > 0 else 0.0
+
+            conn.execute(
+                """
+                UPDATE hop_state
+                SET hop_num = ?, sent = ?, lost = ?, loss_pct = ?
+                WHERE target_id = ? AND hop_num = ?
+                """,
+                (new_hop_num, s_cnt, l_cnt, l_pct, t_id, -new_hop_num),
+            )
+
+    # 2. Backfill last 48h of final-hop losses into permanent loss_events using idx_hop_metrics_loss_ts
+    existing_loss_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM loss_events").fetchone()["cnt"]
+    if existing_loss_cnt == 0 and target_meta:
+        since_ts = int(time.time()) - 172800
+        loss_rows = conn.execute(
+            """
+            SELECT target_id, hop_num, ip_address, timestamp
+            FROM hop_metrics
+            WHERE is_loss = 1 AND timestamp >= ?
+            ORDER BY target_id ASC, timestamp ASC
+            """,
+            (since_ts,),
+        ).fetchall()
+
+        upstream_by_target_ts: Dict[int, Dict[int, List[int]]] = {}
+        final_ts_by_target: Dict[int, List[int]] = {}
+
+        for r in loss_rows:
+            t_id = r["target_id"]
+            if t_id not in target_meta:
+                continue
+            ip = r["ip_address"]
+            hop_num = int(r["hop_num"])
+            if ip == "???" or (hop_num > 1 and ip.startswith("10.") and ip != "10.0.0.1"):
+                continue
+
+            max_hop = target_max_hop.get(t_id, 1)
+            ts = int(r["timestamp"])
+            if hop_num in (1, 2) and hop_num < max_hop:
+                upstream_by_target_ts.setdefault(t_id, {}).setdefault(ts, []).append(hop_num)
+            if hop_num >= max_hop:
+                ts_list = final_ts_by_target.setdefault(t_id, [])
+                if not ts_list or ts_list[-1] != ts:
+                    ts_list.append(ts)
+
+        for t_id, timestamps in final_ts_by_target.items():
+            meta = target_meta[t_id]
+            up_map = upstream_by_target_ts.get(t_id, {})
+            cur_ev: Optional[Dict[str, Any]] = None
+            for ts in timestamps:
+                up_hops = up_map.get(ts, []) + up_map.get(ts - 1, []) + up_map.get(ts + 1, [])
+                if 1 in up_hops:
+                    cause = "Local Router (10.0.0.1) dropped"
+                    severity = "router"
+                elif 2 in up_hops:
+                    cause = "ISP Modem (Hop #2) dropped"
+                    severity = "isp"
+                else:
+                    cause = "Target / Internet Route dropped (Router & Modem OK)"
+                    severity = "target"
+
+                if cur_ev and ts - cur_ev["end_ts"] <= 4:
+                    cur_ev["end_ts"] = ts
+                    cur_ev["packets_lost"] += 1
+                    if severity in ("router", "isp") and cur_ev["severity"] == "target":
+                        cur_ev["cause"] = cause
+                        cur_ev["severity"] = severity
+                else:
+                    if cur_ev:
+                        conn.execute(
+                            """
+                            INSERT INTO loss_events (
+                                target_id, target_label, target_host,
+                                start_ts, end_ts, packets_lost, cause, severity
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                t_id,
+                                meta["label"],
+                                meta["host"],
+                                cur_ev["start_ts"],
+                                cur_ev["end_ts"],
+                                cur_ev["packets_lost"],
+                                cur_ev["cause"],
+                                cur_ev["severity"],
+                            ),
+                        )
+                    cur_ev = {
+                        "start_ts": ts,
+                        "end_ts": ts,
+                        "packets_lost": 1,
+                        "cause": cause,
+                        "severity": severity,
+                    }
+            if cur_ev:
+                conn.execute(
+                    """
+                    INSERT INTO loss_events (
+                        target_id, target_label, target_host,
+                        start_ts, end_ts, packets_lost, cause, severity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        t_id,
+                        meta["label"],
+                        meta["host"],
+                        cur_ev["start_ts"],
+                        cur_ev["end_ts"],
+                        cur_ev["packets_lost"],
+                        cur_ev["cause"],
+                        cur_ev["severity"],
+                    ),
+                )
 
 
 def init_db() -> None:
-    """Initialize SQLite schema, purge unroutable ISP 10.x hops, and sync hop counters."""
+    """Initialize SQLite schema, indexes, default targets, and run one-time v2 migration."""
     with get_db_connection() as conn:
         conn.executescript(
             """
@@ -84,6 +331,35 @@ def init_db() -> None:
                 FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS loss_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_id INTEGER NOT NULL,
+                target_label TEXT NOT NULL,
+                target_host TEXT NOT NULL,
+                start_ts INTEGER NOT NULL,
+                end_ts INTEGER NOT NULL,
+                packets_lost INTEGER NOT NULL DEFAULT 1,
+                cause TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS network_outages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_ts INTEGER NOT NULL,
+                end_ts INTEGER NOT NULL,
+                duration_sec INTEGER NOT NULL DEFAULT 1,
+                affected_targets INTEGER NOT NULL DEFAULT 0,
+                total_external_targets INTEGER NOT NULL DEFAULT 0,
+                router_reachable INTEGER NOT NULL DEFAULT 1,
+                affected_labels TEXT NOT NULL DEFAULT ''
+            );
+
             CREATE INDEX IF NOT EXISTS idx_hop_metrics_target_ts
                 ON hop_metrics(target_id, timestamp);
 
@@ -92,6 +368,18 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_hop_metrics_loss_ts
                 ON hop_metrics(is_loss, timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_hop_metrics_ts
+                ON hop_metrics(timestamp);
+
+            CREATE INDEX IF NOT EXISTS idx_loss_events_start
+                ON loss_events(start_ts DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_loss_events_target_start
+                ON loss_events(target_id, start_ts DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_network_outages_start
+                ON network_outages(start_ts DESC);
             """
         )
 
@@ -109,73 +397,16 @@ def init_db() -> None:
                 )
             logger.info("Seeded %d default targets into %s", len(DEFAULT_TARGETS), DB_PATH)
 
-        # 1. Purge unroutable ISP-internal 10.x hops (e.g. 10.170.193.x) and '???' hops
-        conn.execute(
-            """
-            DELETE FROM hop_metrics
-            WHERE ip_address = '???'
-               OR (hop_num > 1 AND ip_address LIKE '10.%' AND ip_address != '10.0.0.1')
-            """
-        )
-        conn.execute(
-            """
-            DELETE FROM hop_state
-            WHERE ip_address = '???'
-               OR (hop_num > 1 AND ip_address LIKE '10.%' AND ip_address != '10.0.0.1')
-            """
-        )
-
-        # 2. Renumber remaining hop_state rows sequentially (1..N) per target and
-        #    recalculate true Sent / Lost / Loss % from hop_metrics so round-robin DNS
-        #    targets (like Fortnite) never lose their 24h+ packet loss counts!
-        t_rows = conn.execute("SELECT id FROM targets").fetchall()
-        for tr in t_rows:
-            t_id = tr["id"]
-            hops = conn.execute(
-                "SELECT * FROM hop_state WHERE target_id = ? ORDER BY hop_num ASC",
-                (t_id,),
-            ).fetchall()
-            if not hops:
-                continue
-
-            max_old_hop = hops[-1]["hop_num"]
-            for new_idx, h in enumerate(hops):
-                new_hop_num = new_idx + 1
-                is_final = h["hop_num"] == max_old_hop
-
-                if is_final:
-                    # For the final destination hop, aggregate all final-hop probes for this target
-                    stat = conn.execute(
-                        """
-                        SELECT COUNT(*) AS total_sent, COALESCE(SUM(is_loss), 0) AS total_lost
-                        FROM hop_metrics
-                        WHERE target_id = ?
-                          AND hop_num >= ?
-                        """,
-                        (t_id, new_hop_num),
-                    ).fetchone()
-                else:
-                    stat = conn.execute(
-                        """
-                        SELECT COUNT(*) AS total_sent, COALESCE(SUM(is_loss), 0) AS total_lost
-                        FROM hop_metrics
-                        WHERE target_id = ? AND ip_address = ?
-                        """,
-                        (t_id, h["ip_address"]),
-                    ).fetchone()
-
-                s_cnt = int(stat["total_sent"]) if (stat and stat["total_sent"]) else int(h["sent"])
-                l_cnt = int(stat["total_lost"]) if (stat and stat["total_sent"]) else int(h["lost"])
-                l_pct = round((l_cnt / s_cnt) * 100.0, 2) if s_cnt > 0 else 0.0
-
-                conn.execute(
-                    """
-                    UPDATE hop_state
-                    SET hop_num = ?, sent = ?, lost = ?, loss_pct = ?
-                    WHERE target_id = ? AND hop_num = ?
-                    """,
-                    (new_hop_num, s_cnt, l_cnt, l_pct, t_id, h["hop_num"]),
-                )
+        ver_row = conn.execute(
+            "SELECT value FROM app_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        current_ver = int(ver_row["value"]) if ver_row else 1
+        if current_ver < 2:
+            _migrate_to_v2(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '2')"
+            )
+            logger.info("Migrated database %s to schema_version=2", DB_PATH)
 
 
 def list_targets() -> List[Dict[str, Any]]:
@@ -300,6 +531,16 @@ def reset_target_stats(target_id: int) -> None:
     with get_db_connection() as conn:
         conn.execute("DELETE FROM hop_state WHERE target_id = ?", (target_id,))
         conn.execute("DELETE FROM hop_metrics WHERE target_id = ?", (target_id,))
+        conn.execute("DELETE FROM loss_events WHERE target_id = ?", (target_id,))
+
+
+def clear_loss_events(target_id: Optional[int] = None) -> None:
+    with get_db_connection() as conn:
+        if target_id is not None:
+            conn.execute("DELETE FROM loss_events WHERE target_id = ?", (target_id,))
+        else:
+            conn.execute("DELETE FROM loss_events")
+            conn.execute("DELETE FROM network_outages")
 
 
 def get_hop_states(target_id: int) -> List[Dict[str, Any]]:
@@ -347,9 +588,17 @@ def save_probe_results(
     timestamp: int,
     hop_states: List[Dict[str, Any]],
     raw_samples: List[Dict[str, Any]],
-) -> None:
-    """Persist updated hop state rows and append time-series probe samples."""
+    target_label: str = "",
+    target_host: str = "",
+) -> bool:
+    """
+    Persist updated hop state rows, append time-series probe samples, and
+    immediately record/extend a permanent `loss_events` row whenever the final
+    destination drops a packet. Returns True if a destination loss was recorded.
+    """
     max_hop = max((h["hop_num"] for h in hop_states), default=0)
+    loss_recorded = False
+
     with get_db_connection() as conn:
         if max_hop > 0:
             conn.execute(
@@ -421,6 +670,180 @@ def save_probe_results(
             ],
         )
 
+        final_sample = raw_samples[-1] if raw_samples else None
+        if final_sample and final_sample["is_loss"]:
+            loss_recorded = True
+            if len(raw_samples) > 1 and raw_samples[0]["is_loss"]:
+                cause = f"Local Router ({raw_samples[0]['ip_address']}) dropped"
+                severity = "router"
+            elif len(raw_samples) > 2 and raw_samples[1]["is_loss"]:
+                cause = f"ISP Modem ({raw_samples[1]['ip_address']}) dropped"
+                severity = "isp"
+            elif len(raw_samples) == 1:
+                dest_disp = target_host or final_sample["ip_address"]
+                cause = f"Target ({dest_disp}) unreachable"
+                severity = "router" if _is_private_ip(final_sample["ip_address"]) else "target"
+            else:
+                cause = "Target / Internet Route dropped (Router & Modem OK)"
+                severity = "target"
+
+            if not target_label or not target_host:
+                t_row = conn.execute(
+                    "SELECT host, label FROM targets WHERE id = ?", (target_id,)
+                ).fetchone()
+                if t_row:
+                    target_label = target_label or t_row["label"]
+                    target_host = target_host or t_row["host"]
+
+            prev = conn.execute(
+                """
+                SELECT id, end_ts, packets_lost, cause, severity
+                FROM loss_events
+                WHERE target_id = ?
+                ORDER BY end_ts DESC, id DESC
+                LIMIT 1
+                """,
+                (target_id,),
+            ).fetchone()
+
+            if prev and (timestamp - int(prev["end_ts"]) <= 4):
+                new_end = max(int(prev["end_ts"]), timestamp)
+                new_pkts = int(prev["packets_lost"]) + 1
+                new_cause = prev["cause"]
+                new_sev = prev["severity"]
+                if severity in ("router", "isp") and prev["severity"] == "target":
+                    new_cause = cause
+                    new_sev = severity
+                conn.execute(
+                    """
+                    UPDATE loss_events
+                    SET end_ts = ?, packets_lost = ?, cause = ?, severity = ?
+                    WHERE id = ?
+                    """,
+                    (new_end, new_pkts, new_cause, new_sev, prev["id"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO loss_events (
+                        target_id, target_label, target_host,
+                        start_ts, end_ts, packets_lost, cause, severity
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        target_id,
+                        target_label or f"Target #{target_id}",
+                        target_host or final_sample["ip_address"],
+                        timestamp,
+                        timestamp,
+                        cause,
+                        severity,
+                    ),
+                )
+
+    return loss_recorded
+
+
+def upsert_network_outage(
+    timestamp: int,
+    affected_targets: int,
+    total_external_targets: int,
+    router_reachable: bool,
+    affected_labels: List[str],
+) -> Dict[str, Any]:
+    """Record or extend a network-wide internet outage incident."""
+    clean_labels: List[str] = []
+    for lbl in affected_labels:
+        lbl = lbl.strip()
+        if lbl and lbl not in clean_labels:
+            clean_labels.append(lbl)
+
+    with get_db_connection() as conn:
+        prev = conn.execute(
+            """
+            SELECT id, start_ts, end_ts, duration_sec, affected_targets,
+                   total_external_targets, router_reachable, affected_labels
+            FROM network_outages
+            ORDER BY end_ts DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        if prev and (timestamp - int(prev["end_ts"]) <= 5):
+            new_start = min(int(prev["start_ts"]), timestamp)
+            new_end = max(int(prev["end_ts"]), timestamp)
+            duration = max(1, new_end - new_start + 1)
+            new_affected = max(int(prev["affected_targets"]), affected_targets)
+            new_total = max(int(prev["total_external_targets"]), total_external_targets)
+            new_router = 0 if (not router_reachable or int(prev["router_reachable"]) == 0) else 1
+
+            merged_labels: List[str] = []
+            for item in (prev["affected_labels"].split(",") if prev["affected_labels"] else []) + clean_labels:
+                s = item.strip()
+                if s and s not in merged_labels:
+                    merged_labels.append(s)
+            labels_str = ", ".join(merged_labels)
+
+            conn.execute(
+                """
+                UPDATE network_outages
+                SET start_ts = ?, end_ts = ?, duration_sec = ?,
+                    affected_targets = ?, total_external_targets = ?,
+                    router_reachable = ?, affected_labels = ?
+                WHERE id = ?
+                """,
+                (
+                    new_start,
+                    new_end,
+                    duration,
+                    new_affected,
+                    new_total,
+                    new_router,
+                    labels_str,
+                    prev["id"],
+                ),
+            )
+            outage_id = prev["id"]
+        else:
+            new_start = timestamp
+            new_end = timestamp
+            duration = 1
+            new_affected = affected_targets
+            new_total = total_external_targets
+            new_router = 1 if router_reachable else 0
+            labels_str = ", ".join(clean_labels)
+
+            cur = conn.execute(
+                """
+                INSERT INTO network_outages (
+                    start_ts, end_ts, duration_sec,
+                    affected_targets, total_external_targets,
+                    router_reachable, affected_labels
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_start,
+                    new_end,
+                    duration,
+                    new_affected,
+                    new_total,
+                    new_router,
+                    labels_str,
+                ),
+            )
+            outage_id = cur.lastrowid
+
+    return {
+        "id": outage_id,
+        "start_ts": new_start,
+        "end_ts": new_end,
+        "duration_sec": duration,
+        "affected_targets": new_affected,
+        "total_external_targets": new_total,
+        "router_reachable": bool(new_router),
+        "affected_labels": labels_str,
+    }
+
 
 def get_target_history(
     target_id: int,
@@ -466,8 +889,6 @@ def get_target_history(
             is_final = h_num == max_hop_num
 
             if is_final:
-                # Match all final-hop probes (hop_num >= max_hop_num) so round-robin DNS
-                # targets keep their full 24h history intact
                 if bucket_sec == 1:
                     rows = conn.execute(
                         """
@@ -544,138 +965,131 @@ def get_loss_events(
     limit: int = 500,
 ) -> Dict[str, Any]:
     """
-    Return a chronological list of every time a target's Final Destination lost a packet.
-    Matches all final-hop probes (even across round-robin DNS IPs) and checks whether
-    Hop #1 (Local Router) or Hop #2 (ISP Modem) dropped at the same second.
+    Query permanent `loss_events` and `network_outages` tables directly via indexes.
+    Instantaneous even with millions of `hop_metrics` rows.
     """
     now = int(time.time())
     since_ts = (now - window_seconds) if window_seconds > 0 else 0
 
+    where_clauses: List[str] = []
+    params: List[Any] = []
+    if since_ts > 0:
+        where_clauses.append("start_ts >= ?")
+        params.append(since_ts)
+    if target_id is not None:
+        where_clauses.append("target_id = ?")
+        params.append(target_id)
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    outage_where = "WHERE start_ts >= ?" if since_ts > 0 else ""
+    outage_params: List[Any] = [since_ts] if since_ts > 0 else []
+
     with get_db_connection() as conn:
-        targets_rows = conn.execute("SELECT id, host, label FROM targets").fetchall()
-        target_map = {r["id"]: {"host": r["host"], "label": r["label"]} for r in targets_rows}
+        summary_row = conn.execute(
+            f"SELECT COUNT(*) AS cnt, COALESCE(SUM(packets_lost), 0) AS pkts FROM loss_events {where_sql}",
+            params,
+        ).fetchone()
 
-        if not target_map:
-            return {"events": [], "summary": {"total_incidents": 0, "total_packets_lost": 0}}
-
-        final_hops_rows = conn.execute(
-            """
-            SELECT target_id, MAX(hop_num) AS max_hop
-            FROM hop_state
-            GROUP BY target_id
-            """
+        event_rows = conn.execute(
+            f"""
+            SELECT id, target_id, target_label, target_host,
+                   start_ts, end_ts, packets_lost, cause, severity
+            FROM loss_events
+            {where_sql}
+            ORDER BY start_ts DESC, id DESC
+            LIMIT ?
+            """,
+            [*params, limit],
         ).fetchall()
-        final_hop_num_map = {r["target_id"]: r["max_hop"] for r in final_hops_rows}
 
-        incidents: List[Dict[str, Any]] = []
-        total_packets_lost = 0
+        outage_cnt_row = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM network_outages {outage_where}",
+            outage_params,
+        ).fetchone()
 
-        target_ids = (
-            [target_id]
-            if (target_id is not None and target_id in target_map)
-            else list(target_map.keys())
-        )
+        outage_rows = conn.execute(
+            f"""
+            SELECT id, start_ts, end_ts, duration_sec,
+                   affected_targets, total_external_targets,
+                   router_reachable, affected_labels
+            FROM network_outages
+            {outage_where}
+            ORDER BY start_ts DESC, id DESC
+            LIMIT 100
+            """,
+            outage_params,
+        ).fetchall()
 
-        for t_id in target_ids:
-            max_hop = final_hop_num_map.get(t_id, 1)
-
-            # All timestamps where the final destination hop lost a packet
-            lost_rows = conn.execute(
-                """
-                SELECT DISTINCT timestamp
-                FROM hop_metrics
-                WHERE target_id = ?
-                  AND hop_num >= ?
-                  AND is_loss = 1
-                  AND timestamp >= ?
-                ORDER BY timestamp ASC
-                """,
-                (t_id, max_hop, since_ts),
-            ).fetchall()
-
-            if not lost_rows:
-                continue
-
-            # Check if Hop #1 (Router) or Hop #2 (ISP Modem) also dropped at those times
-            upstream_drops = conn.execute(
-                """
-                SELECT timestamp, hop_num
-                FROM hop_metrics
-                WHERE target_id = ?
-                  AND hop_num IN (1, 2)
-                  AND hop_num < ?
-                  AND is_loss = 1
-                  AND timestamp >= ?
-                """,
-                (t_id, max_hop, since_ts),
-            ).fetchall()
-            upstream_by_ts: Dict[int, List[int]] = {}
-            for u in upstream_drops:
-                upstream_by_ts.setdefault(int(u["timestamp"]), []).append(int(u["hop_num"]))
-
-            t_meta = target_map[t_id]
-            current_inc: Optional[Dict[str, Any]] = None
-
-            for r in lost_rows:
-                ts = int(r["timestamp"])
-                total_packets_lost += 1
-
-                up_hops = (
-                    upstream_by_ts.get(ts, [])
-                    + upstream_by_ts.get(ts - 1, [])
-                    + upstream_by_ts.get(ts + 1, [])
-                )
-                if 1 in up_hops:
-                    cause = "Local Router (10.0.0.1) dropped"
-                    severity = "router"
-                elif 2 in up_hops:
-                    cause = "ISP Modem (Hop #2) dropped"
-                    severity = "isp"
-                else:
-                    cause = "Target / Internet Route dropped (Router & Modem OK)"
-                    severity = "target"
-
-                if current_inc and (ts - current_inc["end_ts"] <= 3):
-                    current_inc["end_ts"] = ts
-                    current_inc["packets_lost"] += 1
-                    if severity in ("router", "isp") and current_inc["severity"] == "target":
-                        current_inc["cause"] = cause
-                        current_inc["severity"] = severity
-                else:
-                    if current_inc:
-                        incidents.append(current_inc)
-                    current_inc = {
-                        "target_id": t_id,
-                        "target_label": t_meta["label"],
-                        "target_host": t_meta["host"],
-                        "start_ts": ts,
-                        "end_ts": ts,
-                        "packets_lost": 1,
-                        "cause": cause,
-                        "severity": severity,
-                    }
-
-            if current_inc:
-                incidents.append(current_inc)
-
-        incidents.sort(key=lambda x: x["start_ts"], reverse=True)
-        incidents = incidents[:limit]
-
-        return {
-            "events": incidents,
-            "summary": {
-                "total_incidents": len(incidents),
-                "total_packets_lost": total_packets_lost,
-            },
+    events = [
+        {
+            "id": r["id"],
+            "target_id": r["target_id"],
+            "target_label": r["target_label"],
+            "target_host": r["target_host"],
+            "start_ts": r["start_ts"],
+            "end_ts": r["end_ts"],
+            "packets_lost": r["packets_lost"],
+            "cause": r["cause"],
+            "severity": r["severity"],
         }
+        for r in event_rows
+    ]
+
+    outages = [
+        {
+            "id": r["id"],
+            "start_ts": r["start_ts"],
+            "end_ts": r["end_ts"],
+            "duration_sec": r["duration_sec"],
+            "affected_targets": r["affected_targets"],
+            "total_external_targets": r["total_external_targets"],
+            "router_reachable": bool(r["router_reachable"]),
+            "affected_labels": r["affected_labels"],
+        }
+        for r in outage_rows
+    ]
+
+    return {
+        "events": events,
+        "outages": outages,
+        "summary": {
+            "total_incidents": int(summary_row["cnt"]),
+            "total_packets_lost": int(summary_row["pkts"]),
+            "total_outages": int(outage_cnt_row["cnt"]),
+        },
+    }
 
 
-def prune_old_metrics() -> int:
-    """Delete hop_metrics rows older than RETENTION_HOURS."""
+def prune_old_metrics(batch_size: int = 5000, max_batches: int = 20) -> int:
+    """
+    Delete hop_metrics rows older than RETENTION_HOURS in small indexed batches
+    so SQLite never locks for seconds. Permanent loss_events and network_outages
+    are kept for LOSS_RETENTION_DAYS (default 365 days).
+    """
     cutoff = int(time.time()) - (RETENTION_HOURS * 3600)
+    total_deleted = 0
+
+    for _ in range(max_batches):
+        with get_db_connection() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM hop_metrics
+                WHERE id IN (
+                    SELECT id FROM hop_metrics WHERE timestamp < ? LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            )
+            deleted = cur.rowcount
+        total_deleted += deleted
+        if deleted < batch_size:
+            break
+
+    loss_cutoff = int(time.time()) - (LOSS_RETENTION_DAYS * 86400)
     with get_db_connection() as conn:
-        cur = conn.execute("DELETE FROM hop_metrics WHERE timestamp < ?", (cutoff,))
-        deleted = cur.rowcount
-    if deleted > 0:
-        logger.info("Pruned %d historical metric rows older than %d hours", deleted, RETENTION_HOURS)
-    return deleted
+        conn.execute("DELETE FROM loss_events WHERE end_ts < ?", (loss_cutoff,))
+        conn.execute("DELETE FROM network_outages WHERE end_ts < ?", (loss_cutoff,))
+
+    if total_deleted > 0:
+        logger.info("Pruned %d historical metric rows older than %d hours", total_deleted, RETENTION_HOURS)
+    return total_deleted

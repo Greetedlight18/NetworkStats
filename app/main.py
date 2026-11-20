@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -25,7 +26,7 @@ HOST_VALIDATION_RE = re.compile(r"^[a-zA-Z0-9.\-:]+$")
 
 
 class ConnectionManager:
-    """Manages active WebSocket clients for sub-second UI broadcasts."""
+    """Manages active WebSocket clients with timeout-protected concurrent broadcasts."""
 
     def __init__(self) -> None:
         self.active_connections: List[WebSocket] = []
@@ -38,18 +39,27 @@ class ConnectionManager:
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
 
+    async def _send_one(self, websocket: WebSocket, message: Dict[str, Any]) -> bool:
+        try:
+            await asyncio.wait_for(websocket.send_json(message), timeout=1.5)
+            return True
+        except Exception:
+            try:
+                await asyncio.wait_for(websocket.close(), timeout=0.5)
+            except Exception:
+                pass
+            return False
+
     async def broadcast(self, message: Dict[str, Any]) -> None:
         clients = list(self.active_connections)
         if not clients:
             return
-        stale: List[WebSocket] = []
-        for ws in clients:
-            try:
-                await ws.send_json(message)
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            if ws in self.active_connections:
+        results = await asyncio.gather(
+            *(self._send_one(ws, message) for ws in clients),
+            return_exceptions=True,
+        )
+        for ws, ok in zip(clients, results):
+            if ok is not True and ws in self.active_connections:
                 self.active_connections.remove(ws)
 
 
@@ -60,8 +70,8 @@ monitor_engine = MonitorEngine(broadcast_cb=ws_manager.broadcast)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting NetworkStats Server...")
-    database.init_db()
-    database.prune_old_metrics()
+    await database.run_db_write(database.init_db)
+    await database.run_db_write(database.prune_old_metrics)
     await monitor_engine.start()
     yield
     logger.info("Shutting down NetworkStats Server...")
@@ -71,7 +81,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NetworkStats",
     description="Self-Hosted 24/7 Network Monitoring and Visual Traceroute Web Application",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -105,12 +115,21 @@ async def serve_index():
 
 @app.get("/api/health")
 async def health_check():
-    return {"app": "NetworkStats", "status": "ok"}
+    now = int(time.time())
+    last_ts = monitor_engine.last_probe_ts
+    return {
+        "app": "NetworkStats",
+        "status": "ok",
+        "active_workers": len(monitor_engine._tasks),
+        "last_probe_ts": last_ts,
+        "seconds_since_last_probe": (now - last_ts) if last_ts else None,
+    }
 
 
 @app.get("/api/targets")
 async def api_list_targets():
-    return {"targets": database.list_targets()}
+    targets = await database.run_db_read(database.list_targets)
+    return {"targets": targets}
 
 
 @app.post("/api/targets", status_code=201)
@@ -120,10 +139,11 @@ async def api_create_target(req: TargetCreateRequest):
         raise HTTPException(status_code=400, detail="Invalid IP address or hostname format.")
 
     try:
-        target = database.add_target(
-            host=host,
-            label=req.label.strip() if req.label else host,
-            interval_sec=req.interval_sec,
+        target = await database.run_db_write(
+            database.add_target,
+            host,
+            req.label.strip() if req.label else host,
+            req.interval_sec,
         )
     except Exception as exc:
         if "UNIQUE" in str(exc).upper():
@@ -131,18 +151,19 @@ async def api_create_target(req: TargetCreateRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
     await monitor_engine.sync_workers()
-    targets = database.list_targets()
-    await ws_manager.broadcast({"type": "targets_changed", "targets": targets})
+    targets = await database.run_db_read(database.list_targets)
+    asyncio.create_task(ws_manager.broadcast({"type": "targets_changed", "targets": targets}))
     return {"target": target, "targets": targets}
 
 
 @app.patch("/api/targets/{target_id}")
 async def api_update_target(target_id: int, req: TargetUpdateRequest):
-    updated = database.update_target(
-        target_id=target_id,
-        label=req.label,
-        interval_sec=req.interval_sec,
-        enabled=req.enabled,
+    updated = await database.run_db_write(
+        database.update_target,
+        target_id,
+        req.label,
+        req.interval_sec,
+        req.enabled,
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Target not found.")
@@ -150,43 +171,45 @@ async def api_update_target(target_id: int, req: TargetUpdateRequest):
     await monitor_engine.sync_workers(
         restart_target_id=target_id if req.interval_sec is not None else None
     )
-    targets = database.list_targets()
-    await ws_manager.broadcast({"type": "targets_changed", "targets": targets})
+    targets = await database.run_db_read(database.list_targets)
+    asyncio.create_task(ws_manager.broadcast({"type": "targets_changed", "targets": targets}))
     return {"target": updated, "targets": targets}
 
 
 @app.delete("/api/targets/{target_id}")
 async def api_delete_target(target_id: int):
-    deleted = database.delete_target(target_id)
+    deleted = await database.run_db_write(database.delete_target, target_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Target not found.")
 
     monitor_engine.reset_target_memory(target_id)
     await monitor_engine.sync_workers()
-    targets = database.list_targets()
-    await ws_manager.broadcast({"type": "targets_changed", "targets": targets})
+    targets = await database.run_db_read(database.list_targets)
+    asyncio.create_task(ws_manager.broadcast({"type": "targets_changed", "targets": targets}))
+    asyncio.create_task(ws_manager.broadcast({"type": "loss_update"}))
     return {"deleted": True, "targets": targets}
 
 
 @app.post("/api/targets/{target_id}/reset")
 async def api_reset_target(target_id: int):
-    existing = database.get_target(target_id)
+    existing = await database.run_db_read(database.get_target, target_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Target not found.")
 
-    database.reset_target_stats(target_id)
+    await database.run_db_write(database.reset_target_stats, target_id)
     monitor_engine.reset_target_memory(target_id)
-    targets = database.list_targets()
-    await ws_manager.broadcast({"type": "targets_changed", "targets": targets})
+    targets = await database.run_db_read(database.list_targets)
+    asyncio.create_task(ws_manager.broadcast({"type": "targets_changed", "targets": targets}))
+    asyncio.create_task(ws_manager.broadcast({"type": "loss_update"}))
     return {"reset": True, "targets": targets}
 
 
 @app.get("/api/targets/{target_id}/hops")
 async def api_get_target_hops(target_id: int):
-    target = database.get_target(target_id)
+    target = await database.run_db_read(database.get_target, target_id)
     if not target:
         raise HTTPException(status_code=404, detail="Target not found.")
-    hops = database.get_hop_states(target_id)
+    hops = await database.run_db_read(database.get_hop_states, target_id)
     return {"target": target, "hops": hops}
 
 
@@ -196,7 +219,7 @@ async def api_get_target_history(
     window: int = Query(default=300, ge=60, le=172800, description="Time window in seconds"),
     hops: Optional[str] = Query(default=None, description="Comma-separated hop numbers"),
 ):
-    target = database.get_target(target_id)
+    target = await database.run_db_read(database.get_target, target_id)
     if not target:
         raise HTTPException(status_code=404, detail="Target not found.")
 
@@ -204,35 +227,49 @@ async def api_get_target_history(
     if hops:
         hop_list = [int(x.strip()) for x in hops.split(",") if x.strip().isdigit()]
 
-    history = database.get_target_history(
-        target_id=target_id,
-        window_seconds=window,
-        hop_nums=hop_list,
+    history = await database.run_db_read(
+        database.get_target_history,
+        target_id,
+        window,
+        hop_list,
     )
     return history
 
 
 @app.get("/api/loss-events")
 async def api_get_loss_events(
-    window: int = Query(default=0, ge=0, le=2592000, description="Time window in seconds (0 = all time)"),
+    window: int = Query(default=0, ge=0, le=31536000, description="Time window in seconds (0 = all time)"),
     target_id: Optional[int] = Query(default=None, description="Optional target ID filter"),
 ):
-    return database.get_loss_events(
-        window_seconds=window,
-        target_id=target_id,
+    return await database.run_db_read(
+        database.get_loss_events,
+        window,
+        target_id,
     )
+
+
+@app.delete("/api/loss-events")
+async def api_clear_loss_events(
+    target_id: Optional[int] = Query(default=None, description="Optional target ID filter"),
+):
+    await database.run_db_write(database.clear_loss_events, target_id)
+    asyncio.create_task(ws_manager.broadcast({"type": "loss_update"}))
+    return {"cleared": True}
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
-        targets = database.list_targets()
-        await websocket.send_json({"type": "init", "targets": targets})
+        targets = await database.run_db_read(database.list_targets)
+        await asyncio.wait_for(
+            websocket.send_json({"type": "init", "targets": targets}),
+            timeout=2.0,
+        )
         while True:
             data = await websocket.receive_text()
             if data == "ping":
-                await websocket.send_json({"type": "pong"})
+                await asyncio.wait_for(websocket.send_json({"type": "pong"}), timeout=1.5)
     except WebSocketDisconnect:
         await ws_manager.disconnect(websocket)
     except Exception:

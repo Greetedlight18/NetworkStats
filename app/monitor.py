@@ -5,12 +5,19 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import socket
 import time
 from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional, Tuple
 
-from icmplib import async_multiping, traceroute
+from icmplib import async_ping, traceroute
+
+try:
+    from icmplib import SocketPermissionError
+except ImportError:  # pragma: no cover
+    class SocketPermissionError(Exception):
+        pass
 
 from app import database
 
@@ -21,6 +28,15 @@ ROLLING_WINDOW_SIZE = 100
 SPARKLINE_SIZE = 30
 RDNS_TTL_SEC = 3600
 SHARED_PING_CACHE_TTL = 0.75
+_PING_TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
+
+
+def _is_valid_ip(val: str) -> bool:
+    try:
+        ipaddress.ip_address(val)
+        return True
+    except Exception:
+        return False
 
 
 def _is_private_or_cgnat_ip(ip_str: str) -> bool:
@@ -67,12 +83,13 @@ class RDNSResolver:
         loop = asyncio.get_running_loop()
         hostname = ip
         try:
-            res = await asyncio.wait_for(
-                loop.run_in_executor(None, socket.gethostbyaddr, ip),
-                timeout=2.0,
-            )
-            if res and res[0]:
-                hostname = res[0]
+            if _is_valid_ip(ip):
+                res = await asyncio.wait_for(
+                    loop.run_in_executor(None, socket.gethostbyaddr, ip),
+                    timeout=2.0,
+                )
+                if res and res[0]:
+                    hostname = res[0]
         except Exception:
             hostname = ip
         finally:
@@ -80,57 +97,128 @@ class RDNSResolver:
             self._in_flight.discard(ip)
 
 
-class SharedPingProber:
+class PingProber:
     """
-    Deduplicates ICMP Echo probes across all monitored targets so shared hops
-    (like Hop #1 router and Hop #2 ISP modem) are only pinged once per second total.
+    Lock-free, in-flight deduplicated ICMP Echo prober.
+    - Never blocks one target's ping on another target's timeout.
+    - Isolates individual host errors (timeouts, Network Unreachable, DNS failure)
+      so a failing host always returns (None, True) without corrupting healthy hops.
+    - Deduplicates shared hops (router, modem) across concurrent targets via short
+      result caching and shared in-flight asyncio.Tasks.
     """
 
     def __init__(self) -> None:
         self._cache: Dict[str, Tuple[Optional[float], bool, float]] = {}
-        self._lock: Optional[asyncio.Lock] = None
+        self._in_flight: Dict[str, asyncio.Task] = {}
+        self._icmp_id: int = 0
+        self._ping_bin = shutil.which("ping")
 
     async def probe_ips(self, ips: List[str]) -> Dict[str, Tuple[Optional[float], bool]]:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-
-        now = time.monotonic()
         results: Dict[str, Tuple[Optional[float], bool]] = {}
-        direct_ips: List[str] = []
+        pending_ips: List[str] = []
+        pending_tasks: List[asyncio.Task] = []
+        seen: set[str] = set()
 
-        async with self._lock:
-            for ip in ips:
-                if not ip or ip == "???":
-                    continue
-                cached = self._cache.get(ip)
-                if cached and cached[2] > now:
-                    results[ip] = (cached[0], cached[1])
-                elif ip not in direct_ips:
-                    direct_ips.append(ip)
+        for ip in ips:
+            if not ip or ip == "???" or ip in seen:
+                continue
+            seen.add(ip)
+            now = time.monotonic()
+            cached = self._cache.get(ip)
+            if cached and cached[2] > now:
+                results[ip] = (cached[0], cached[1])
+            else:
+                task = self._in_flight.get(ip)
+                if task is None or task.done():
+                    task = asyncio.create_task(self._probe_one_ip(ip))
+                    self._in_flight[ip] = task
+                pending_ips.append(ip)
+                pending_tasks.append(task)
 
-            if direct_ips:
-                try:
-                    responses = await async_multiping(
-                        direct_ips,
-                        count=1,
-                        timeout=0.8,
-                        privileged=True,
-                    )
-                    resp_time = time.monotonic()
-                    for r in responses:
-                        if r.is_alive:
-                            ms = round(float(r.avg_rtt), 2)
-                            self._cache[r.address] = (ms, False, resp_time + SHARED_PING_CACHE_TTL)
-                            results[r.address] = (ms, False)
-                        else:
-                            self._cache[r.address] = (None, True, resp_time + SHARED_PING_CACHE_TTL)
-                            results[r.address] = (None, True)
-                except Exception as exc:
-                    logger.error("Error in async_multiping: %s", exc)
-                    for ip in direct_ips:
-                        results[ip] = (None, True)
+        if pending_tasks:
+            gathered = await asyncio.gather(*pending_tasks, return_exceptions=True)
+            for ip, res in zip(pending_ips, gathered):
+                if isinstance(res, Exception) or not isinstance(res, tuple):
+                    results[ip] = (None, True)
+                else:
+                    results[ip] = res
 
         return results
+
+    async def _probe_one_ip(self, ip: str) -> Tuple[Optional[float], bool]:
+        try:
+            if _is_valid_ip(ip):
+                resolved_ip = ip
+            else:
+                loop = asyncio.get_running_loop()
+                try:
+                    resolved_ip = await asyncio.wait_for(
+                        loop.run_in_executor(None, socket.gethostbyname, ip),
+                        timeout=1.0,
+                    )
+                    if not resolved_ip or not _is_valid_ip(resolved_ip):
+                        self._cache[ip] = (None, True, time.monotonic() + SHARED_PING_CACHE_TTL)
+                        return (None, True)
+                except Exception:
+                    self._cache[ip] = (None, True, time.monotonic() + SHARED_PING_CACHE_TTL)
+                    return (None, True)
+
+            self._icmp_id = (self._icmp_id % 65000) + 1
+            icmp_id = self._icmp_id
+
+            try:
+                host_res = await asyncio.wait_for(
+                    async_ping(resolved_ip, count=1, timeout=0.8, id=icmp_id, privileged=True),
+                    timeout=1.3,
+                )
+                if (
+                    host_res.is_alive
+                    and getattr(host_res, "packets_received", 1) >= 1
+                    and host_res.avg_rtt is not None
+                ):
+                    result: Tuple[Optional[float], bool] = (round(float(host_res.avg_rtt), 2), False)
+                else:
+                    result = (None, True)
+            except SocketPermissionError:
+                result = await self._ping_cli_fallback(resolved_ip)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                result = (None, True)
+
+            self._cache[ip] = (result[0], result[1], time.monotonic() + SHARED_PING_CACHE_TTL)
+            return result
+        finally:
+            if self._in_flight.get(ip) is asyncio.current_task():
+                self._in_flight.pop(ip, None)
+
+    async def _ping_cli_fallback(self, ip: str) -> Tuple[Optional[float], bool]:
+        if not self._ping_bin:
+            return (None, True)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._ping_bin,
+                "-n",
+                "-c",
+                "1",
+                "-W",
+                "1",
+                ip,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.5)
+            if proc.returncode == 0:
+                text = stdout.decode("utf-8", errors="ignore")
+                match = _PING_TIME_RE.search(text)
+                if match:
+                    return (round(float(match.group(1)), 2), False)
+                return (0.5, False)
+            return (None, True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return (None, True)
 
 
 class HopStatsAccumulator:
@@ -259,9 +347,8 @@ class HopStatsAccumulator:
 
 class MonitorEngine:
     """
-    Manages per-target route discovery and continuous 1s hop probing.
-    Locks each target's route once discovered (until Reset) so round-robin DNS
-    or intermittent intermediate routers never shift hop numbers or wipe loss counters.
+    Manages per-target route discovery, continuous 1s hop probing, and
+    network-wide outage correlation without ever blocking on WebSockets or SQLite.
     """
 
     def __init__(
@@ -274,9 +361,13 @@ class MonitorEngine:
         self._running = False
         self._rdns = RDNSResolver()
         self._mtr_bin = shutil.which("mtr")
-        self._prober = SharedPingProber()
+        self._prober = PingProber()
         self._hop_accumulators: Dict[int, Dict[int, HopStatsAccumulator]] = {}
         self._locked_routes: Dict[int, List[str]] = {}
+        self._route_needs_discovery: set[int] = set()
+        self._bg_route_tasks: Dict[int, asyncio.Task] = {}
+        self._target_live_status: Dict[int, Dict[str, Any]] = {}
+        self.last_probe_ts: Optional[int] = None
 
     async def start(self) -> None:
         self._running = True
@@ -290,13 +381,17 @@ class MonitorEngine:
             self._prune_task.cancel()
         for task in self._tasks.values():
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        for task in self._bg_route_tasks.values():
+            task.cancel()
+        all_tasks = list(self._tasks.values()) + list(self._bg_route_tasks.values())
+        if all_tasks:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
         self._tasks.clear()
+        self._bg_route_tasks.clear()
 
     async def sync_workers(self, restart_target_id: Optional[int] = None) -> None:
         """Synchronize running tasks with active targets in the SQLite database."""
-        targets = database.list_targets()
+        targets = await database.run_db_read(database.list_targets)
         active_ids = {t["id"] for t in targets if t["enabled"]}
 
         if restart_target_id is not None and restart_target_id in self._tasks:
@@ -307,13 +402,14 @@ class MonitorEngine:
             if t_id not in active_ids:
                 self._tasks[t_id].cancel()
                 del self._tasks[t_id]
+                self._target_live_status.pop(t_id, None)
                 logger.info("Stopped monitoring worker for target_id=%d", t_id)
 
         for t in targets:
             t_id = t["id"]
             if t["enabled"] and t_id not in self._tasks:
                 if t_id not in self._hop_accumulators:
-                    self._load_existing_accumulators(t_id, t["host"])
+                    await self._load_existing_accumulators(t_id, t["host"])
                 self._tasks[t_id] = asyncio.create_task(self._target_loop(t_id))
                 logger.info(
                     "Started monitoring worker for target_id=%d (%s - %s, %.1fs)",
@@ -326,17 +422,21 @@ class MonitorEngine:
     def reset_target_memory(self, target_id: int) -> None:
         self._hop_accumulators.pop(target_id, None)
         self._locked_routes.pop(target_id, None)
+        self._route_needs_discovery.discard(target_id)
+        self._target_live_status.pop(target_id, None)
+        bg = self._bg_route_tasks.pop(target_id, None)
+        if bg:
+            bg.cancel()
 
-    def _load_existing_accumulators(self, target_id: int, host: str) -> None:
+    async def _load_existing_accumulators(self, target_id: int, host: str) -> None:
         """
         Restore hop accumulators and locked route from SQLite so container restarts
-        or route refreshes never wipe cumulative Sent / Lost / Loss % counters.
+        never wipe cumulative Sent / Lost / Loss % counters.
         """
-        existing_hops = database.get_hop_states(target_id)
+        existing_hops = await database.run_db_read(database.get_hop_states, target_id)
         acc_map: Dict[int, HopStatsAccumulator] = {}
         route_ips: List[str] = []
 
-        # Filter out any dead ISP-internal private hops (hop > 1 with 10.x / CGNAT IP)
         valid_hops = []
         for idx, h in enumerate(existing_hops):
             ip = h["ip_address"]
@@ -372,102 +472,197 @@ class MonitorEngine:
     async def _prune_loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(1800)
-                database.prune_old_metrics()
+                await asyncio.sleep(300)
+                await database.run_db_write(database.prune_old_metrics)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.error("Error in database prune loop: %s", exc)
 
+    async def _safe_broadcast(self, message: Dict[str, Any]) -> None:
+        try:
+            await asyncio.wait_for(self._broadcast_cb(message), timeout=2.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("WebSocket broadcast error ignored: %s", exc)
+
+    async def _check_network_outage(self, now_ts: int) -> None:
+        """
+        Detect when the majority of active external targets drop simultaneously and
+        persist a unified network outage record in `network_outages`.
+        """
+        recent = [
+            s for s in self._target_live_status.values()
+            if now_ts - int(s["ts"]) <= 5
+        ]
+        external = [s for s in recent if s["is_external"]]
+        if len(external) < 2:
+            return
+
+        down_ext = [s for s in external if s["is_down"]]
+        threshold = max(2, math.ceil(len(external) * 0.6))
+        if len(down_ext) < threshold:
+            return
+
+        local_targets = [s for s in recent if not s["is_external"]]
+        if local_targets and any(s["is_down"] for s in local_targets):
+            router_reachable = False
+        elif all(not s["router_ok"] for s in down_ext):
+            router_reachable = False
+        else:
+            router_reachable = True
+
+        await database.run_db_write(
+            database.upsert_network_outage,
+            now_ts,
+            len(down_ext),
+            len(external),
+            router_reachable,
+            [s["label"] for s in down_ext],
+        )
+
+    async def _process_target_tick(self, target: Dict[str, Any], now_ts: Optional[int] = None) -> None:
+        """Execute one full probe + persistence + outage check cycle for a target."""
+        target_id = target["id"]
+        host = target["host"]
+
+        raw_hops = await self._probe_route(target_id, host)
+        if not raw_hops:
+            return
+
+        if now_ts is None:
+            now_ts = int(time.time())
+
+        acc_map = self._hop_accumulators.setdefault(target_id, {})
+        max_hop = max(h["hop_num"] for h in raw_hops)
+        for old_hop in list(acc_map.keys()):
+            if old_hop > max_hop:
+                del acc_map[old_hop]
+
+        hop_states: List[Dict[str, Any]] = []
+        raw_samples: List[Dict[str, Any]] = []
+
+        for h in raw_hops:
+            hop_num = h["hop_num"]
+            ip_addr = h["ip_address"]
+            is_loss = h["is_loss"]
+            latency_ms = h["latency_ms"]
+            rdns = self._rdns.get_cached(ip_addr)
+            if hop_num == max_hop and rdns == ip_addr and host != ip_addr:
+                rdns = host
+
+            acc = acc_map.get(hop_num)
+            if not acc:
+                acc = HopStatsAccumulator(hop_num=hop_num)
+                acc_map[hop_num] = acc
+
+            acc.record_sample(
+                ip_address=ip_addr,
+                rdns_hostname=rdns,
+                latency_ms=latency_ms,
+                is_loss=is_loss,
+            )
+            state_dict = acc.to_dict()
+            hop_states.append(state_dict)
+            raw_samples.append(
+                {
+                    "hop_num": hop_num,
+                    "ip_address": acc.ip_address,
+                    "rdns_hostname": acc.rdns_hostname,
+                    "latency_ms": latency_ms if not is_loss else None,
+                    "is_loss": is_loss,
+                }
+            )
+
+        loss_recorded = await database.run_db_write(
+            database.save_probe_results,
+            target_id,
+            now_ts,
+            hop_states,
+            raw_samples,
+            target["label"],
+            host,
+        )
+
+        self.last_probe_ts = now_ts
+        final_sample = raw_samples[-1]
+        final_is_loss = bool(final_sample["is_loss"])
+        is_external = (
+            not _is_private_or_cgnat_ip(final_sample["ip_address"])
+            and not _is_private_or_cgnat_ip(host)
+        )
+        router_ok = not (len(raw_samples) > 1 and raw_samples[0]["is_loss"])
+
+        self._target_live_status[target_id] = {
+            "is_down": final_is_loss,
+            "is_external": is_external,
+            "label": target["label"],
+            "host": host,
+            "router_ok": router_ok,
+            "ts": now_ts,
+        }
+
+        if target_id in self._route_needs_discovery and not final_is_loss:
+            self._route_needs_discovery.discard(target_id)
+            bg = self._bg_route_tasks.get(target_id)
+            if bg is None or bg.done():
+                self._bg_route_tasks[target_id] = asyncio.create_task(
+                    self._discover_full_route_bg(target_id, host)
+                )
+
+        if loss_recorded:
+            await self._check_network_outage(now_ts)
+            asyncio.create_task(
+                self._safe_broadcast(
+                    {
+                        "type": "loss_update",
+                        "target_id": target_id,
+                        "timestamp": now_ts,
+                    }
+                )
+            )
+
+        final_hop = hop_states[-1] if hop_states else None
+        asyncio.create_task(
+            self._safe_broadcast(
+                {
+                    "type": "probe_update",
+                    "target_id": target_id,
+                    "host": host,
+                    "label": target["label"],
+                    "timestamp": now_ts,
+                    "hops": hop_states,
+                    "summary": {
+                        "current_ms": final_hop["last_ms"] if final_hop else None,
+                        "avg_ms": final_hop["avg_ms"] if final_hop else None,
+                        "jitter_ms": final_hop["jitter_ms"] if final_hop else 0.0,
+                        "rolling_loss_pct": (
+                            final_hop["rolling_loss_pct"] if final_hop else 0.0
+                        ),
+                        "loss_pct": final_hop["loss_pct"] if final_hop else 0.0,
+                        "lost_count": final_hop["lost"] if final_hop else 0,
+                        "hop_count": len(hop_states),
+                    },
+                }
+            )
+        )
+
     async def _target_loop(self, target_id: int) -> None:
         while self._running:
             cycle_start = time.monotonic()
-            target = database.get_target(target_id)
+            target = await database.run_db_read(database.get_target, target_id)
             if not target or not target["enabled"]:
                 break
 
-            host = target["host"]
             interval = float(target.get("interval_sec") or DEFAULT_INTERVAL)
 
             try:
-                raw_hops = await self._probe_route(target_id, host)
-                if raw_hops:
-                    now_ts = int(time.time())
-                    acc_map = self._hop_accumulators.setdefault(target_id, {})
-
-                    max_hop = max(h["hop_num"] for h in raw_hops)
-                    for old_hop in list(acc_map.keys()):
-                        if old_hop > max_hop:
-                            del acc_map[old_hop]
-
-                    hop_states: List[Dict[str, Any]] = []
-                    raw_samples: List[Dict[str, Any]] = []
-
-                    for h in raw_hops:
-                        hop_num = h["hop_num"]
-                        ip_addr = h["ip_address"]
-                        is_loss = h["is_loss"]
-                        latency_ms = h["latency_ms"]
-                        rdns = self._rdns.get_cached(ip_addr)
-                        if hop_num == max_hop and rdns == ip_addr and host != ip_addr:
-                            rdns = host
-
-                        acc = acc_map.get(hop_num)
-                        if not acc:
-                            acc = HopStatsAccumulator(hop_num=hop_num)
-                            acc_map[hop_num] = acc
-
-                        acc.record_sample(
-                            ip_address=ip_addr,
-                            rdns_hostname=rdns,
-                            latency_ms=latency_ms,
-                            is_loss=is_loss,
-                        )
-                        state_dict = acc.to_dict()
-                        hop_states.append(state_dict)
-                        raw_samples.append(
-                            {
-                                "hop_num": hop_num,
-                                "ip_address": acc.ip_address,
-                                "rdns_hostname": acc.rdns_hostname,
-                                "latency_ms": latency_ms if not is_loss else None,
-                                "is_loss": is_loss,
-                            }
-                        )
-
-                    database.save_probe_results(
-                        target_id=target_id,
-                        timestamp=now_ts,
-                        hop_states=hop_states,
-                        raw_samples=raw_samples,
-                    )
-
-                    final_hop = hop_states[-1] if hop_states else None
-                    await self._broadcast_cb(
-                        {
-                            "type": "probe_update",
-                            "target_id": target_id,
-                            "host": host,
-                            "label": target["label"],
-                            "timestamp": now_ts,
-                            "hops": hop_states,
-                            "summary": {
-                                "current_ms": final_hop["last_ms"] if final_hop else None,
-                                "avg_ms": final_hop["avg_ms"] if final_hop else None,
-                                "jitter_ms": final_hop["jitter_ms"] if final_hop else 0.0,
-                                "rolling_loss_pct": (
-                                    final_hop["rolling_loss_pct"] if final_hop else 0.0
-                                ),
-                                "loss_pct": final_hop["loss_pct"] if final_hop else 0.0,
-                                "lost_count": final_hop["lost"] if final_hop else 0,
-                                "hop_count": len(hop_states),
-                            },
-                        }
-                    )
+                await self._process_target_tick(target)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.error("Probe error for target %s (%d): %s", host, target_id, exc)
+                logger.error("Probe error for target %s (%d): %s", target["host"], target_id, exc)
 
             elapsed = time.monotonic() - cycle_start
             sleep_for = max(0.05, interval - elapsed)
@@ -477,26 +672,24 @@ class MonitorEngine:
                 break
 
     async def _resolve_host_ip(self, host: str) -> str:
+        if _is_valid_ip(host):
+            return host
         loop = asyncio.get_running_loop()
         try:
             res = await asyncio.wait_for(
                 loop.run_in_executor(None, socket.gethostbyname, host),
-                timeout=2.0,
+                timeout=1.5,
             )
             return res or host
         except Exception:
             return host
 
-    async def _get_locked_route(self, target_id: int, host: str) -> List[str]:
-        """
-        Return the locked hop IP list for `target_id`.
-        Discovers the route once when the target starts (or after Reset) using 2 cycles
-        so hops never randomly appear/disappear mid-session.
-        """
-        if target_id in self._locked_routes and self._locked_routes[target_id]:
-            return self._locked_routes[target_id]
-
+    async def _discover_clean_route(self, host: str) -> Tuple[List[str], bool]:
+        """Discover and clean route hops to `host`. Returns (clean_ips, resolved_ok)."""
         dest_ip = await self._resolve_host_ip(host)
+        if not _is_valid_ip(dest_ip):
+            return [host], False
+
         raw_ips: List[str] = []
 
         if self._mtr_bin:
@@ -521,13 +714,15 @@ class MonitorEngine:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8.0)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=6.0)
                 if stdout:
                     payload = json.loads(stdout.decode("utf-8", errors="ignore"))
                     hubs = payload.get("report", {}).get("hubs", [])
                     for hub in hubs:
                         ip_addr = str(hub.get("host", "???")).strip() or "???"
                         raw_ips.append(ip_addr)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.debug("mtr route discovery error for %s: %s", host, exc)
 
@@ -538,16 +733,14 @@ class MonitorEngine:
                     loop.run_in_executor(
                         None, lambda: traceroute(dest_ip, count=1, timeout=0.8, max_hops=24)
                     ),
-                    timeout=10.0,
+                    timeout=6.0,
                 )
                 raw_ips = [h.address for h in hops if h.address]
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.debug("icmplib route discovery error for %s: %s", host, exc)
 
-        # Clean the route:
-        # 1. Strip '???' timeouts
-        # 2. Strip Docker bridge hop #1 (172.16.0.0/12)
-        # 3. Strip unroutable ISP-internal private/CGNAT hops (e.g. 10.170.193.x at Hop > 1)
         clean_ips: List[str] = []
         for idx, ip in enumerate(raw_ips):
             if ip == "???":
@@ -565,7 +758,57 @@ class MonitorEngine:
             else:
                 clean_ips.append(dest_ip)
 
+        return clean_ips, True
+
+    async def _discover_full_route_bg(self, target_id: int, host: str) -> None:
+        """Upgrade a target added during an outage to its full hop route once reachable."""
+        try:
+            clean_ips, resolved_ok = await self._discover_clean_route(host)
+            if not resolved_ok or len(clean_ips) <= 1:
+                return
+
+            acc_map = self._hop_accumulators.get(target_id, {})
+            old_final = acc_map.get(1)
+            new_acc_map: Dict[int, HopStatsAccumulator] = {}
+
+            for idx, ip in enumerate(clean_ips):
+                hop_num = idx + 1
+                if idx == len(clean_ips) - 1 and old_final and old_final.ip_address == ip:
+                    old_final.hop_num = hop_num
+                    new_acc_map[hop_num] = old_final
+                else:
+                    new_acc_map[hop_num] = HopStatsAccumulator(
+                        hop_num=hop_num,
+                        ip_address=ip,
+                        rdns_hostname=self._rdns.get_cached(ip),
+                    )
+
+            self._hop_accumulators[target_id] = new_acc_map
+            self._locked_routes[target_id] = clean_ips
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Background route discovery failed for %s: %s", host, exc)
+
+    async def _get_locked_route(self, target_id: int, host: str) -> List[str]:
+        """
+        Return the locked hop IP list for `target_id`.
+        If DNS fails during an outage, returns `[host]` without locking so every
+        outage second is still probed and logged as packet loss.
+        """
+        if target_id in self._locked_routes and self._locked_routes[target_id]:
+            return self._locked_routes[target_id]
+
+        clean_ips, resolved_ok = await self._discover_clean_route(host)
+        if not resolved_ok:
+            return clean_ips
+
         self._locked_routes[target_id] = clean_ips
+        if len(clean_ips) == 1 and not _is_private_or_cgnat_ip(clean_ips[0]):
+            self._route_needs_discovery.add(target_id)
+        else:
+            self._route_needs_discovery.discard(target_id)
+
         return clean_ips
 
     async def _probe_route(self, target_id: int, host: str) -> List[Dict[str, Any]]:

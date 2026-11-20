@@ -25,6 +25,10 @@ const state = {
   windowSeconds: 300,
   ws: null,
   wsPingTimer: null,
+  hasConnectedOnce: false,
+  disconnectBannerTimer: null,
+  lossRefreshTimer: null,
+  lastLossRefreshAt: 0,
   chart: null,
 };
 
@@ -44,6 +48,7 @@ const elBtnTogglePauseText = document.getElementById('btnTogglePauseText');
 const elBtnResetStats = document.getElementById('btnResetStats');
 const elBtnDeleteTarget = document.getElementById('btnDeleteTarget');
 const elPlottedSummary = document.getElementById('plottedHopsSummary');
+const elWsDisconnectBanner = document.getElementById('wsDisconnectBanner');
 
 // View & Tab Elements
 const elTabBtnLive = document.getElementById('tabBtnLive');
@@ -51,11 +56,14 @@ const elTabBtnLossLog = document.getElementById('tabBtnLossLog');
 const elLossLogBadge = document.getElementById('lossLogBadge');
 const elViewLive = document.getElementById('viewLiveMonitor');
 const elViewLossLog = document.getElementById('viewLossLog');
+const elOutagesTableBody = document.getElementById('outagesTableBody');
 const elLossLogTableBody = document.getElementById('lossLogTableBody');
+const elLossLogTotalOutages = document.getElementById('lossLogTotalOutages');
 const elLossLogTotalIncidents = document.getElementById('lossLogTotalIncidents');
 const elLossLogTotalPackets = document.getElementById('lossLogTotalPackets');
 const elSelectLossTargetFilter = document.getElementById('selectLossTargetFilter');
 const elSelectLossWindowFilter = document.getElementById('selectLossWindowFilter');
+const elBtnClearLossLog = document.getElementById('btnClearLossLog');
 
 // Modal Elements
 const elAddModal = document.getElementById('addTargetModal');
@@ -103,6 +111,13 @@ function formatRelativeAgo(unixSec) {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)}m ago`;
   return `${Math.floor(diff / 86400)}d ago`;
+}
+
+function formatDuration(sec) {
+  const s = Math.max(1, Number(sec || 1));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
 // ============================================================================
@@ -331,15 +346,11 @@ function renderTargetList() {
   const prevFilter = elSelectLossTargetFilter.value;
   elSelectLossTargetFilter.innerHTML = '<option value="">All Targets</option>';
 
-  let totalLostAcrossTargets = 0;
-
   for (const t of state.targets) {
     const opt = document.createElement('option');
     opt.value = String(t.id);
     opt.textContent = `${t.label} (${t.host})`;
     elSelectLossTargetFilter.appendChild(opt);
-
-    totalLostAcrossTargets += Number(t.lost_count || 0);
 
     const isSelected = t.id === state.selectedTargetId;
     const status = getTargetStatus(t);
@@ -380,14 +391,6 @@ function renderTargetList() {
   }
 
   elSelectLossTargetFilter.value = prevFilter;
-
-  if (totalLostAcrossTargets > 0) {
-    elLossLogBadge.textContent = `${totalLostAcrossTargets} pkt${totalLostAcrossTargets > 1 ? 's' : ''}`;
-    elLossLogBadge.classList.remove('hidden');
-  } else {
-    elLossLogBadge.classList.add('hidden');
-  }
-
   updateSelectedTargetHeader();
 }
 
@@ -597,8 +600,63 @@ function renderHopTable() {
 }
 
 // ============================================================================
-// Packet Loss Log View
+// Packet Loss Log & Network-Wide Outages View
 // ============================================================================
+function updateLossLogBadge(summary) {
+  const incidents = Number((summary && summary.total_incidents) || 0);
+  if (incidents > 0) {
+    elLossLogBadge.textContent = String(incidents);
+    elLossLogBadge.classList.remove('hidden');
+  } else {
+    elLossLogBadge.classList.add('hidden');
+  }
+}
+
+async function refreshLossBadge() {
+  try {
+    const res = await fetch('/api/loss-events?window=0');
+    if (!res.ok) return;
+    const data = await res.json();
+    updateLossLogBadge(data.summary);
+  } catch (err) {
+    console.error('Failed refreshing loss badge:', err);
+  }
+}
+
+function scheduleLossLogRefresh(immediate = false) {
+  const run = async () => {
+    state.lastLossRefreshAt = Date.now();
+    if (state.activeTab === 'losslog') {
+      await loadLossLog();
+    } else {
+      await refreshLossBadge();
+    }
+  };
+
+  if (immediate) {
+    if (state.lossRefreshTimer) {
+      clearTimeout(state.lossRefreshTimer);
+      state.lossRefreshTimer = null;
+    }
+    run();
+    return;
+  }
+
+  const elapsed = Date.now() - state.lastLossRefreshAt;
+  if (elapsed >= 2000) {
+    if (state.lossRefreshTimer) {
+      clearTimeout(state.lossRefreshTimer);
+      state.lossRefreshTimer = null;
+    }
+    run();
+  } else if (!state.lossRefreshTimer) {
+    state.lossRefreshTimer = setTimeout(() => {
+      state.lossRefreshTimer = null;
+      run();
+    }, 2000 - elapsed);
+  }
+}
+
 async function loadLossLog() {
   const windowSec = Number(elSelectLossWindowFilter.value || 0);
   const targetFilter = elSelectLossTargetFilter.value;
@@ -610,26 +668,93 @@ async function loadLossLog() {
     if (!res.ok) return;
     const data = await res.json();
     renderLossLogTable(data);
+    if (windowSec === 0 && !targetFilter) {
+      updateLossLogBadge(data.summary);
+    } else {
+      refreshLossBadge();
+    }
   } catch (err) {
     console.error('Failed loading loss events:', err);
   }
 }
 
+function renderOutagesTable(outages) {
+  elOutagesTableBody.innerHTML = '';
+
+  if (!outages || outages.length === 0) {
+    elOutagesTableBody.innerHTML = `
+      <tr>
+        <td colspan="6" class="py-5 text-center text-slate-500 font-sans text-xs">
+          No network-wide internet outages recorded in this window.
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  for (const o of outages) {
+    const startD = new Date(o.start_ts * 1000);
+    const endD = new Date(o.end_ts * 1000);
+    const startStr = startD.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    const endStr = endD.toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+
+    const diagText = o.router_reachable
+      ? 'ISP / WAN Outage (Local Router OK)'
+      : 'Local Router / LAN Down';
+    const diagClass = o.router_reachable
+      ? 'text-rose-300 bg-rose-950/60 border-rose-800/70'
+      : 'text-amber-300 bg-amber-950/60 border-amber-800/70';
+
+    const tr = document.createElement('tr');
+    tr.className = 'hover:bg-slate-900/60 transition';
+    tr.innerHTML = `
+      <td class="py-2.5 px-4 text-slate-200">${escapeHtml(startStr)} &rarr; ${escapeHtml(endStr)}</td>
+      <td class="py-2.5 px-3 text-slate-500">${formatRelativeAgo(o.start_ts)}</td>
+      <td class="py-2.5 px-3 text-right text-rose-400 font-semibold">${formatDuration(o.duration_sec)}</td>
+      <td class="py-2.5 px-3 text-center text-slate-200">${o.affected_targets}/${o.total_external_targets}</td>
+      <td class="py-2.5 px-3">
+        <span class="px-2 py-0.5 rounded border text-[11px] font-sans ${diagClass}">
+          ${escapeHtml(diagText)}
+        </span>
+      </td>
+      <td class="py-2.5 px-4 text-slate-400 truncate max-w-md">${escapeHtml(o.affected_labels || '')}</td>
+    `;
+    elOutagesTableBody.appendChild(tr);
+  }
+}
+
 function renderLossLogTable(data) {
   const events = data.events || [];
+  const outages = data.outages || [];
   const summary = data.summary || {
     total_incidents: 0,
     total_packets_lost: 0,
+    total_outages: 0,
   };
 
+  if (elLossLogTotalOutages) {
+    elLossLogTotalOutages.textContent = String(summary.total_outages || 0);
+  }
   elLossLogTotalIncidents.textContent = String(summary.total_incidents || 0);
   elLossLogTotalPackets.textContent = String(summary.total_packets_lost || 0);
+
+  renderOutagesTable(outages);
   elLossLogTableBody.innerHTML = '';
 
   if (events.length === 0) {
     elLossLogTableBody.innerHTML = `
       <tr>
-        <td colspan="5" class="py-12 text-center text-slate-500 font-sans text-xs">
+        <td colspan="5" class="py-10 text-center text-slate-500 font-sans text-xs">
           No packet loss recorded for this filter.
         </td>
       </tr>
@@ -670,7 +795,7 @@ function renderLossLogTable(data) {
         <span class="text-slate-500 ml-1">(${escapeHtml(ev.target_host)})</span>
       </td>
       <td class="py-2.5 px-3 text-right text-rose-400 font-semibold">
-        ${ev.packets_lost} lost${durationSec > 1 ? ` (${durationSec}s)` : ''}
+        ${ev.packets_lost} lost${durationSec > 1 ? ` (${formatDuration(durationSec)})` : ''}
       </td>
       <td class="py-2.5 px-4">
         <span class="px-2 py-0.5 rounded border text-[11px] font-sans ${causeClass}">
@@ -726,16 +851,48 @@ async function loadHistoryForCurrentTarget() {
   }
 }
 
+async function refreshAfterReconnect() {
+  try {
+    const res = await fetch('/api/targets');
+    if (res.ok) {
+      const data = await res.json();
+      state.targets = data.targets || [];
+      renderTargetList();
+    }
+  } catch (err) {
+    console.error('Failed refreshing targets after reconnect:', err);
+  }
+  if (state.selectedTargetId) {
+    await selectTarget(state.selectedTargetId);
+  }
+  scheduleLossLogRefresh(true);
+}
+
 function connectWebSocket() {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
   state.ws = ws;
 
   ws.onopen = () => {
+    if (state.disconnectBannerTimer) {
+      clearTimeout(state.disconnectBannerTimer);
+      state.disconnectBannerTimer = null;
+    }
+    if (elWsDisconnectBanner) {
+      elWsDisconnectBanner.classList.add('hidden');
+    }
+
     if (state.wsPingTimer) clearInterval(state.wsPingTimer);
     state.wsPingTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) ws.send('ping');
     }, 15000);
+
+    if (state.hasConnectedOnce) {
+      refreshAfterReconnect();
+    } else {
+      state.hasConnectedOnce = true;
+      refreshLossBadge();
+    }
   };
 
   ws.onmessage = (event) => {
@@ -748,6 +905,11 @@ function connectWebSocket() {
 
   ws.onclose = () => {
     if (state.wsPingTimer) clearInterval(state.wsPingTimer);
+    if (!state.disconnectBannerTimer && elWsDisconnectBanner) {
+      state.disconnectBannerTimer = setTimeout(() => {
+        elWsDisconnectBanner.classList.remove('hidden');
+      }, 4000);
+    }
     setTimeout(connectWebSocket, 2000);
   };
 }
@@ -763,6 +925,11 @@ function handleWsMessage(msg) {
     } else {
       renderTargetList();
     }
+    return;
+  }
+
+  if (msg.type === 'loss_update') {
+    scheduleLossLogRefresh(false);
     return;
   }
 
@@ -818,6 +985,15 @@ function bindEvents() {
   elSelectLossWindowFilter.addEventListener('change', loadLossLog);
   document.getElementById('btnRefreshLossLog').addEventListener('click', loadLossLog);
 
+  if (elBtnClearLossLog) {
+    elBtnClearLossLog.addEventListener('click', async () => {
+      if (!confirm('Clear all recorded outages and packet loss logs?')) return;
+      await fetch('/api/loss-events', { method: 'DELETE' });
+      await loadLossLog();
+      await refreshLossBadge();
+    });
+  }
+
   document.querySelectorAll('.time-window-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.time-window-btn').forEach((b) => {
@@ -862,6 +1038,7 @@ function bindEvents() {
     state.historySeries = {};
     renderHopTable();
     renderTimelineChart();
+    scheduleLossLogRefresh(true);
   });
 
   elBtnDeleteTarget.addEventListener('click', async () => {
@@ -869,6 +1046,7 @@ function bindEvents() {
     if (!target) return;
     if (!confirm(`Delete target "${target.label}"?`)) return;
     await fetch(`/api/targets/${target.id}`, { method: 'DELETE' });
+    scheduleLossLogRefresh(true);
   });
 
   const openModal = () => {

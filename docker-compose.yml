@@ -13,7 +13,8 @@ services:
       - TZ=America/New_York
       - DB_PATH=/data/networkstats.db
       - PROBE_INTERVAL=1.0
-      - RETENTION_HOURS=168
+      - RETENTION_HOURS=48
+      - LOSS_RETENTION_DAYS=365
     cap_add:
       - NET_RAW
       - NET_ADMIN
