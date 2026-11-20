@@ -289,15 +289,15 @@ class GraphTimelineTests(unittest.TestCase):
                 self.assertEqual(live_pt["lost_pkts"], db_pt["lost_pkts"])
                 self.assertEqual(live_pt["total_pkts"], db_pt["total_pkts"])
 
-    def test_no_cache_and_portainer_live_mount_configured(self) -> None:
+    def test_no_cache_and_portainer_compose_compatibility(self) -> None:
         """
-        Verify docker-compose.yml mounts ./app:/app/app:ro and sets pull_policy: build,
-        and index.html + app/main.py bust browser caching on static assets.
+        Verify docker-compose.yml avoids relative ./app bind mounts and pull_policy: build
+        (which break Portainer Git stacks), and index.html + app/main.py bust static caching.
         """
         with open("docker-compose.yml") as f:
             compose_text = f.read()
-        self.assertIn("./app:/app/app:ro", compose_text)
-        self.assertIn("pull_policy: build", compose_text)
+        self.assertNotIn("./app:/app/app", compose_text)
+        self.assertNotIn("pull_policy: build", compose_text)
 
         with open("app/static/index.html") as f:
             index_html = f.read()
