@@ -50,7 +50,7 @@ if "fastapi" not in sys.modules:
         def _decorator(self, *args, **kwargs):
             return lambda fn: fn
 
-        get = post = patch = delete = websocket = _decorator
+        get = post = patch = delete = websocket = middleware = _decorator
 
     class _DummyHTTPException(Exception):
         def __init__(self, status_code=500, detail=""):
@@ -63,6 +63,7 @@ if "fastapi" not in sys.modules:
     fastapi_stub.FastAPI = _DummyApp
     fastapi_stub.HTTPException = _DummyHTTPException
     fastapi_stub.Query = lambda *args, **kwargs: None
+    fastapi_stub.Request = object
     fastapi_stub.WebSocket = object
     fastapi_stub.WebSocketDisconnect = Exception
     fastapi_cors_stub.CORSMiddleware = object

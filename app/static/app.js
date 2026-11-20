@@ -102,7 +102,7 @@ function formatMs(val) {
 
 function formatTimeLabel(unixSec, windowSec) {
   const d = new Date(unixSec * 1000);
-  if (windowSec > 21600) {
+  if (windowSec >= 3600) {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -162,6 +162,20 @@ function switchTab(tabName) {
 // ============================================================================
 // Chart.js Timeline
 // ============================================================================
+function getTickStepSec(windowSec) {
+  if (windowSec <= 20) return 5;
+  if (windowSec <= 60) return 10;
+  if (windowSec <= 120) return 15;
+  if (windowSec <= 240) return 30;
+  if (windowSec <= 420) return 60;
+  if (windowSec <= 1200) return 180;
+  if (windowSec <= 3600) return 600;
+  if (windowSec <= 7200) return 900;
+  if (windowSec <= 14400) return 1800;
+  if (windowSec <= 28800) return 3600;
+  return 14400;
+}
+
 function initTimelineChart() {
   const ctx = document.getElementById('timelineChart').getContext('2d');
   state.chart = new Chart(ctx, {
@@ -200,7 +214,21 @@ function initTimelineChart() {
               if (item.raw && item.raw.lostPkts !== undefined) {
                 return `Packet Loss: ${item.raw.lostPkts}/${item.raw.totalPkts} pkts (${item.raw.lossPct}%)`;
               }
-              return `${item.dataset.label}: ${Number(item.parsed.y).toFixed(1)} ms`;
+              const valStr = `${Number(item.parsed.y).toFixed(1)} ms`;
+              if (
+                state.bucketSec > 1 &&
+                item.raw &&
+                item.raw.maxMs !== null &&
+                item.raw.maxMs !== undefined
+              ) {
+                const minVal =
+                  item.raw.minMs !== null && item.raw.minMs !== undefined
+                    ? Number(item.raw.minMs).toFixed(1)
+                    : Number(item.parsed.y).toFixed(1);
+                const maxVal = Number(item.raw.maxMs).toFixed(1);
+                return `${item.dataset.label}: ${valStr} (min ${minVal} / max ${maxVal} ms)`;
+              }
+              return `${item.dataset.label}: ${valStr}`;
             },
           },
         },
@@ -225,13 +253,36 @@ function initTimelineChart() {
       scales: {
         x: {
           type: 'linear',
+          bounds: 'data',
+          grace: 0,
           grid: { color: 'rgba(30, 41, 59, 0.4)' },
+          afterBuildTicks: (axis) => {
+            const minSec = axis.min;
+            const maxSec = axis.max;
+            if (!Number.isFinite(minSec) || !Number.isFinite(maxSec) || maxSec <= minSec) {
+              return;
+            }
+            const stepSec = getTickStepSec(maxSec - minSec);
+            // Align tick intervals to the browser's local wall-clock offset instead of Chart.js base-10 steps.
+            const tzOffsetSec = new Date(minSec * 1000).getTimezoneOffset() * 60;
+            const firstLocal = Math.ceil((minSec - tzOffsetSec) / stepSec) * stepSec;
+            const ticks = [];
+            for (let v = firstLocal + tzOffsetSec; v <= maxSec + 0.001; v += stepSec) {
+              ticks.push({ value: v });
+            }
+            axis.ticks = ticks;
+          },
           ticks: {
             color: '#64748b',
             maxRotation: 0,
-            autoSkip: true,
-            maxTicksLimit: 8,
-            callback: (val) => formatTimeLabel(Math.round(val), state.windowSeconds),
+            autoSkip: false,
+            callback(val) {
+              const span =
+                Number.isFinite(this?.max) && Number.isFinite(this?.min)
+                  ? Math.max(1, this.max - this.min)
+                  : state.windowSeconds;
+              return formatTimeLabel(Math.round(val), span);
+            },
             font: { family: 'ui-monospace, monospace', size: 10 },
           },
         },
@@ -300,44 +351,41 @@ function renderTimelineChart() {
 
     datasets.push({
       type: 'line',
-      label: state.bucketSec > 1 && hNum === primaryHop ? `${hopLabel} (Avg)` : hopLabel,
-      data: seriesArr.map((pt) => ({
-        x: pt.ts,
-        y: pt.ms !== null && pt.ms !== undefined ? pt.ms : null,
-      })),
+      label: hopLabel,
+      data: seriesArr.map((pt, idx) => {
+        if (pt.ms === null || pt.ms === undefined) {
+          return { x: pt.ts, y: null };
+        }
+        // Smooth the brand-new partial bucket at the right edge on bucketed views (1h/6h/24h)
+        // so a single 1s sample at second 1 of a new minute doesn't jump relative to 60s averages.
+        if (
+          state.bucketSec > 1 &&
+          idx === seriesArr.length - 1 &&
+          idx > 0 &&
+          (pt.total_pkts || 1) < Math.min(5, state.bucketSec)
+        ) {
+          const prev = seriesArr[idx - 1];
+          if (prev && prev.ms !== null && prev.ms !== undefined) {
+            const w = pt.total_pkts || 1;
+            const targetW = Math.min(5, state.bucketSec);
+            const blended =
+              Math.round(((pt.ms * w + prev.ms * (targetW - w)) / targetW) * 100) / 100;
+            return { x: pt.ts, y: blended, minMs: pt.min_ms, maxMs: pt.max_ms };
+          }
+        }
+        return { x: pt.ts, y: pt.ms, minMs: pt.min_ms, maxMs: pt.max_ms };
+      }),
       borderColor: color,
-      backgroundColor: hNum === primaryHop ? 'rgba(34, 211, 238, 0.08)' : 'transparent',
+      backgroundColor: hNum === primaryHop ? 'rgba(34, 211, 238, 0.12)' : 'transparent',
       fill: hNum === primaryHop ? 'origin' : false,
-      borderWidth: 1.75,
+      borderWidth: 2,
       pointRadius: 0,
       pointHoverRadius: 3,
       spanGaps: false,
-      tension: 0.15,
+      tension: 0.25,
       yAxisID: 'yLatency',
       order: 2,
     });
-
-    if (state.bucketSec > 1 && hNum === primaryHop) {
-      datasets.push({
-        type: 'line',
-        label: 'Peak (Max)',
-        data: seriesArr.map((pt) => ({
-          x: pt.ts,
-          y: pt.max_ms !== null && pt.max_ms !== undefined ? pt.max_ms : null,
-        })),
-        borderColor: 'rgba(56, 189, 248, 0.45)',
-        backgroundColor: 'rgba(56, 189, 248, 0.10)',
-        fill: '-1',
-        borderWidth: 1,
-        borderDash: [3, 2],
-        pointRadius: 0,
-        pointHoverRadius: 3,
-        spanGaps: false,
-        tension: 0.15,
-        yAxisID: 'yLatency',
-        order: 3,
-      });
-    }
   }
 
   let lossSpikesInWindow = 0;
@@ -361,10 +409,10 @@ function renderTimelineChart() {
       type: 'bar',
       label: 'Packet Loss',
       data: lossData,
-      backgroundColor: 'rgba(244, 63, 94, 0.75)',
+      backgroundColor: 'rgba(244, 63, 94, 0.85)',
       borderColor: '#f43f5e',
-      borderWidth: 1,
-      barThickness: 3,
+      borderWidth: 0,
+      barThickness: 2,
       grouped: false,
       yAxisID: 'yLoss',
       order: 1,
@@ -374,15 +422,19 @@ function renderTimelineChart() {
   if (plottedHops.length > 0) {
     const hopStr = `Hop ${plottedHops.map((h) => `#${h}`).join(', ')}`;
     elPlottedSummary.textContent =
-      lossSpikesInWindow > 0 ? `${hopStr} • ${lossSpikesInWindow} loss bucket(s)` : hopStr;
+      lossSpikesInWindow > 0
+        ? `${hopStr} • ${lossSpikesInWindow} drop${lossSpikesInWindow === 1 ? '' : 's'}`
+        : hopStr;
   } else {
     elPlottedSummary.textContent = '';
   }
 
   if (!state.isZoomed) {
-    const nowSec = Math.floor(Date.now() / 1000) + state.serverClockOffset;
-    state.chart.options.scales.x.min = nowSec - state.windowSeconds;
-    state.chart.options.scales.x.max = nowSec;
+    const bucketSec = Math.max(1, state.bucketSec || 1);
+    const rawNow = Math.floor(Date.now() / 1000) + state.serverClockOffset;
+    const alignedMax = Math.floor(rawNow / bucketSec) * bucketSec;
+    state.chart.options.scales.x.min = alignedMax - state.windowSeconds;
+    state.chart.options.scales.x.max = alignedMax;
   }
 
   state.chart.data.datasets = datasets;
@@ -1040,6 +1092,10 @@ function handleWsMessage(msg) {
           const prevTotal = Number(lastPt.total_pkts || 1);
           const prevLost = Number(lastPt.lost_pkts || (lastPt.loss > 0 ? 1 : 0));
           const prevValid = Math.max(0, prevTotal - prevLost);
+          const prevSum =
+            lastPt._sum_ms !== undefined
+              ? lastPt._sum_ms
+              : (lastPt.ms !== null && lastPt.ms !== undefined ? Number(lastPt.ms) * prevValid : 0);
           const newTotal = prevTotal + 1;
           const newLost = prevLost + (isLoss ? 1 : 0);
 
@@ -1049,20 +1105,30 @@ function handleWsMessage(msg) {
           if (isLoss) {
             lastPt.loss = 100.0;
           } else if (lastPt.ms === null || prevValid === 0) {
-            lastPt.ms = msVal;
-            lastPt.max_ms = msVal;
-            lastPt.min_ms = msVal;
+            lastPt._sum_ms = msVal;
+            lastPt.ms = Math.round(msVal * 100) / 100;
+            lastPt.max_ms = Math.round(msVal * 100) / 100;
+            lastPt.min_ms = Math.round(msVal * 100) / 100;
           } else {
-            lastPt.ms = Math.round(((lastPt.ms * prevValid + msVal) / (prevValid + 1)) * 100) / 100;
-            lastPt.max_ms = lastPt.max_ms !== null ? Math.max(lastPt.max_ms, msVal) : msVal;
-            lastPt.min_ms = lastPt.min_ms !== null ? Math.min(lastPt.min_ms, msVal) : msVal;
+            lastPt._sum_ms = prevSum + msVal;
+            lastPt.ms = Math.round((lastPt._sum_ms / (prevValid + 1)) * 100) / 100;
+            lastPt.max_ms =
+              lastPt.max_ms !== null
+                ? Math.round(Math.max(lastPt.max_ms, msVal) * 100) / 100
+                : Math.round(msVal * 100) / 100;
+            lastPt.min_ms =
+              lastPt.min_ms !== null
+                ? Math.round(Math.min(lastPt.min_ms, msVal) * 100) / 100
+                : Math.round(msVal * 100) / 100;
           }
         } else if (!lastPt || bucketTs > lastPt.ts) {
+          const roundedMs = isLoss ? null : Math.round(msVal * 100) / 100;
           seriesArr.push({
             ts: bucketTs,
-            ms: msVal,
-            max_ms: msVal,
-            min_ms: msVal,
+            _sum_ms: isLoss ? 0 : msVal,
+            ms: roundedMs,
+            max_ms: roundedMs,
+            min_ms: roundedMs,
             loss: isLoss ? 100.0 : 0.0,
             loss_pct: isLoss ? 100.0 : 0.0,
             lost_pkts: isLoss ? 1 : 0,

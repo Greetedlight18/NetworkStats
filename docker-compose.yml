@@ -3,12 +3,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    pull_policy: build
     container_name: networkstats
     restart: unless-stopped
     ports:
       - "8085:8000"
     volumes:
       - /opt/networkstats/data:/data
+      - ./app:/app/app:ro
     environment:
       - TZ=America/New_York
       - DB_PATH=/data/networkstats.db
