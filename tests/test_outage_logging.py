@@ -458,6 +458,57 @@ class OutageAndReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loss_data_2["summary"]["total_incidents"], 1)
         self.assertEqual(loss_data_2["summary"]["total_packets_lost"], 3)
 
+    async def test_history_bucketing_preserves_peak_spikes_and_loss_counts(self) -> None:
+        """
+        Verify 1h (10s buckets) and 6h (60s buckets) preserve exact peak spike max_ms
+        and exact lost packet counts instead of averaging spikes away.
+        """
+        database.init_db()
+        target = database.list_targets()[1]  # 1.1.1.1
+        t_id = target["id"]
+        start_ts = ((int(time.time()) - 120) // 60) * 60
+
+        with database.get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO hop_state (target_id, hop_num, ip_address, rdns_hostname, sent, lost, loss_pct, rolling_loss_pct, updated_at)
+                VALUES (?, 1, '1.1.1.1', 'one.one.one.one', 60, 3, 5.0, 5.0, ?)
+                """,
+                (t_id, start_ts + 59),
+            )
+            rows = []
+            for i in range(60):
+                ts = start_ts + i
+                if i in (10, 11, 12):
+                    rows.append((t_id, 1, "1.1.1.1", "one.one.one.one", ts, None, 1))
+                elif i == 25:
+                    rows.append((t_id, 1, "1.1.1.1", "one.one.one.one", ts, 95.0, 0))
+                else:
+                    rows.append((t_id, 1, "1.1.1.1", "one.one.one.one", ts, 20.0, 0))
+            conn.executemany(
+                """
+                INSERT INTO hop_metrics (target_id, hop_num, ip_address, rdns_hostname, timestamp, latency_ms, is_loss)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+        hist_1h = database.get_target_history(t_id, window_seconds=3600)
+        self.assertEqual(hist_1h["bucket_sec"], 10)
+        self.assertIn("server_now", hist_1h)
+        series_1h = hist_1h["series"]["1"]
+        self.assertEqual(max(pt["max_ms"] for pt in series_1h if pt["max_ms"] is not None), 95.0)
+        self.assertEqual(sum(pt["lost_pkts"] for pt in series_1h), 3)
+
+        hist_6h = database.get_target_history(t_id, window_seconds=21600)
+        self.assertEqual(hist_6h["bucket_sec"], 60)
+        self.assertIn("server_now", hist_6h)
+        series_6h = hist_6h["series"]["1"]
+        self.assertEqual(len(series_6h), 1)
+        self.assertEqual(series_6h[0]["max_ms"], 95.0)
+        self.assertEqual(series_6h[0]["lost_pkts"], 3)
+        self.assertEqual(series_6h[0]["total_pkts"], 60)
+
 
 if __name__ == "__main__":
     unittest.main()

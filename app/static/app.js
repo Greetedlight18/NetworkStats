@@ -23,6 +23,9 @@ const state = {
   plottedHopsByTarget: {},
   historySeries: {},
   windowSeconds: 300,
+  bucketSec: 1,
+  isZoomed: false,
+  serverClockOffset: 0,
   ws: null,
   wsPingTimer: null,
   hasConnectedOnce: false,
@@ -105,6 +108,17 @@ function formatTimeLabel(unixSec, windowSec) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function formatTooltipTime(unixSec) {
+  const d = new Date(unixSec * 1000);
+  return d.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
 function formatRelativeAgo(unixSec) {
   const diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
   if (diff < 60) return `${diff}s ago`;
@@ -152,12 +166,12 @@ function initTimelineChart() {
   const ctx = document.getElementById('timelineChart').getContext('2d');
   state.chart = new Chart(ctx, {
     type: 'line',
-    data: { labels: [], datasets: [] },
+    data: { datasets: [] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      interaction: { mode: 'index', intersect: false },
+      interaction: { mode: 'x', intersect: false },
       plugins: {
         legend: {
           display: true,
@@ -178,20 +192,46 @@ function initTimelineChart() {
           borderWidth: 1,
           titleFont: { family: 'ui-monospace, monospace', size: 11 },
           bodyFont: { family: 'ui-monospace, monospace', size: 11 },
+          filter: (item) => item.parsed && item.parsed.y !== null,
+          callbacks: {
+            title: (items) =>
+              items.length > 0 ? formatTooltipTime(Math.round(items[0].parsed.x)) : '',
+            label: (item) => {
+              if (item.raw && item.raw.lostPkts !== undefined) {
+                return `Packet Loss: ${item.raw.lostPkts}/${item.raw.totalPkts} pkts (${item.raw.lossPct}%)`;
+              }
+              return `${item.dataset.label}: ${Number(item.parsed.y).toFixed(1)} ms`;
+            },
+          },
         },
         zoom: {
-          pan: { enabled: true, mode: 'x' },
-          zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
+          pan: {
+            enabled: true,
+            mode: 'x',
+            onPanComplete: () => {
+              state.isZoomed = true;
+            },
+          },
+          zoom: {
+            wheel: { enabled: true },
+            pinch: { enabled: true },
+            mode: 'x',
+            onZoomComplete: () => {
+              state.isZoomed = true;
+            },
+          },
         },
       },
       scales: {
         x: {
+          type: 'linear',
           grid: { color: 'rgba(30, 41, 59, 0.4)' },
           ticks: {
             color: '#64748b',
             maxRotation: 0,
             autoSkip: true,
-            maxTicksLimit: 9,
+            maxTicksLimit: 8,
+            callback: (val) => formatTimeLabel(Math.round(val), state.windowSeconds),
             font: { family: 'ui-monospace, monospace', size: 10 },
           },
         },
@@ -210,14 +250,10 @@ function initTimelineChart() {
         yLoss: {
           type: 'linear',
           position: 'right',
+          display: false,
           min: 0,
           max: 100,
           grid: { drawOnChartArea: false },
-          ticks: {
-            color: '#f43f5e',
-            callback: (v) => `${v}%`,
-            font: { family: 'ui-monospace, monospace', size: 10 },
-          },
         },
       },
     },
@@ -251,15 +287,6 @@ function renderTimelineChart() {
   const plottedSet = getPlottedSet(state.selectedTargetId, hops);
   const plottedHops = Array.from(plottedSet).sort((a, b) => a - b);
 
-  const tsSet = new Set();
-  for (const hNum of plottedHops) {
-    for (const pt of state.historySeries[String(hNum)] || []) {
-      tsSet.add(pt.ts);
-    }
-  }
-  const sortedTs = Array.from(tsSet).sort((a, b) => a - b);
-  const labels = sortedTs.map((ts) => formatTimeLabel(ts, state.windowSeconds));
-
   const datasets = [];
   const primaryHop = plottedHops.includes(finalHopNum)
     ? finalHopNum
@@ -269,55 +296,76 @@ function renderTimelineChart() {
     const hopMeta = hops.find((h) => h.hop_num === hNum);
     const hopLabel = hopMeta ? `#${hNum} ${hopMeta.ip_address}` : `#${hNum}`;
     const color = colorForHop(hNum, hNum === finalHopNum);
-
-    const ptMap = new Map();
-    for (const pt of state.historySeries[String(hNum)] || []) {
-      ptMap.set(pt.ts, pt);
-    }
+    const seriesArr = state.historySeries[String(hNum)] || [];
 
     datasets.push({
       type: 'line',
-      label: hopLabel,
-      data: sortedTs.map((ts) => {
-        const item = ptMap.get(ts);
-        return item && item.ms !== null ? item.ms : null;
-      }),
+      label: state.bucketSec > 1 && hNum === primaryHop ? `${hopLabel} (Avg)` : hopLabel,
+      data: seriesArr.map((pt) => ({
+        x: pt.ts,
+        y: pt.ms !== null && pt.ms !== undefined ? pt.ms : null,
+      })),
       borderColor: color,
       backgroundColor: hNum === primaryHop ? 'rgba(34, 211, 238, 0.08)' : 'transparent',
-      fill: hNum === primaryHop,
+      fill: hNum === primaryHop ? 'origin' : false,
       borderWidth: 1.75,
       pointRadius: 0,
       pointHoverRadius: 3,
-      spanGaps: true,
+      spanGaps: false,
       tension: 0.15,
       yAxisID: 'yLatency',
       order: 2,
     });
+
+    if (state.bucketSec > 1 && hNum === primaryHop) {
+      datasets.push({
+        type: 'line',
+        label: 'Peak (Max)',
+        data: seriesArr.map((pt) => ({
+          x: pt.ts,
+          y: pt.max_ms !== null && pt.max_ms !== undefined ? pt.max_ms : null,
+        })),
+        borderColor: 'rgba(56, 189, 248, 0.45)',
+        backgroundColor: 'rgba(56, 189, 248, 0.10)',
+        fill: '-1',
+        borderWidth: 1,
+        borderDash: [3, 2],
+        pointRadius: 0,
+        pointHoverRadius: 3,
+        spanGaps: false,
+        tension: 0.15,
+        yAxisID: 'yLatency',
+        order: 3,
+      });
+    }
   }
 
   let lossSpikesInWindow = 0;
   if (primaryHop !== undefined) {
-    const ptMap = new Map();
-    for (const pt of state.historySeries[String(primaryHop)] || []) {
-      ptMap.set(pt.ts, pt);
-    }
-    const lossData = sortedTs.map((ts) => {
-      const item = ptMap.get(ts);
-      if (item && item.loss > 0) {
+    const primaryArr = state.historySeries[String(primaryHop)] || [];
+    const lossData = [];
+    for (const pt of primaryArr) {
+      if (pt.loss > 0) {
         lossSpikesInWindow += 1;
-        return item.loss;
+        lossData.push({
+          x: pt.ts,
+          y: 100,
+          lossPct: pt.loss_pct !== undefined ? pt.loss_pct : pt.loss,
+          lostPkts: pt.lost_pkts !== undefined ? pt.lost_pkts : 1,
+          totalPkts: pt.total_pkts !== undefined ? pt.total_pkts : 1,
+        });
       }
-      return null;
-    });
+    }
 
     datasets.push({
       type: 'bar',
       label: 'Packet Loss',
       data: lossData,
-      backgroundColor: 'rgba(244, 63, 94, 0.85)',
+      backgroundColor: 'rgba(244, 63, 94, 0.75)',
       borderColor: '#f43f5e',
       borderWidth: 1,
       barThickness: 3,
+      grouped: false,
       yAxisID: 'yLoss',
       order: 1,
     });
@@ -326,12 +374,17 @@ function renderTimelineChart() {
   if (plottedHops.length > 0) {
     const hopStr = `Hop ${plottedHops.map((h) => `#${h}`).join(', ')}`;
     elPlottedSummary.textContent =
-      lossSpikesInWindow > 0 ? `${hopStr} • ${lossSpikesInWindow} loss spike(s) in window` : hopStr;
+      lossSpikesInWindow > 0 ? `${hopStr} • ${lossSpikesInWindow} loss bucket(s)` : hopStr;
   } else {
     elPlottedSummary.textContent = '';
   }
 
-  state.chart.data.labels = labels;
+  if (!state.isZoomed) {
+    const nowSec = Math.floor(Date.now() / 1000) + state.serverClockOffset;
+    state.chart.options.scales.x.min = nowSec - state.windowSeconds;
+    state.chart.options.scales.x.max = nowSec;
+  }
+
   state.chart.data.datasets = datasets;
   state.chart.update('none');
 }
@@ -812,6 +865,12 @@ function renderLossLogTable(data) {
 // ============================================================================
 async function selectTarget(targetId) {
   state.selectedTargetId = targetId;
+  state.isZoomed = false;
+  if (state.chart) {
+    delete state.chart.options.scales.x.min;
+    delete state.chart.options.scales.x.max;
+    state.chart.resetZoom('none');
+  }
   renderTargetList();
 
   try {
@@ -826,6 +885,10 @@ async function selectTarget(targetId) {
     if (histRes.ok) {
       const histData = await histRes.json();
       state.historySeries = histData.series || {};
+      state.bucketSec = histData.bucket_sec || 1;
+      state.serverClockOffset = histData.server_now
+        ? histData.server_now - Math.floor(Date.now() / 1000)
+        : 0;
     }
   } catch (err) {
     console.error('Failed loading target details:', err);
@@ -837,6 +900,12 @@ async function selectTarget(targetId) {
 
 async function loadHistoryForCurrentTarget() {
   if (!state.selectedTargetId) return;
+  state.isZoomed = false;
+  if (state.chart) {
+    delete state.chart.options.scales.x.min;
+    delete state.chart.options.scales.x.max;
+    state.chart.resetZoom('none');
+  }
   try {
     const res = await fetch(
       `/api/targets/${state.selectedTargetId}/history?window=${state.windowSeconds}`
@@ -844,6 +913,10 @@ async function loadHistoryForCurrentTarget() {
     if (res.ok) {
       const data = await res.json();
       state.historySeries = data.series || {};
+      state.bucketSec = data.bucket_sec || 1;
+      state.serverClockOffset = data.server_now
+        ? data.server_now - Math.floor(Date.now() / 1000)
+        : 0;
       renderTimelineChart();
     }
   } catch (err) {
@@ -951,17 +1024,52 @@ function handleWsMessage(msg) {
     renderTargetList();
 
     if (tId === state.selectedTargetId) {
-      const cutoffTs = msg.timestamp - state.windowSeconds;
+      const bucketSec = Math.max(1, state.bucketSec || 1);
+      const bucketTs = Math.floor(msg.timestamp / bucketSec) * bucketSec;
+      const cutoffTs = msg.timestamp - state.windowSeconds - bucketSec;
+
       for (const h of msg.hops || []) {
         const key = String(h.hop_num);
         if (!state.historySeries[key]) state.historySeries[key] = [];
         const seriesArr = state.historySeries[key];
-        const isLoss = h.last_ms === null && h.ip_address !== '???';
-        seriesArr.push({
-          ts: msg.timestamp,
-          ms: h.last_ms,
-          loss: isLoss || h.ip_address === '???' ? 100.0 : 0.0,
-        });
+        const isLoss = h.last_ms === null;
+        const msVal = isLoss ? null : Number(h.last_ms);
+        const lastPt = seriesArr.length > 0 ? seriesArr[seriesArr.length - 1] : null;
+
+        if (lastPt && lastPt.ts === bucketTs) {
+          const prevTotal = Number(lastPt.total_pkts || 1);
+          const prevLost = Number(lastPt.lost_pkts || (lastPt.loss > 0 ? 1 : 0));
+          const prevValid = Math.max(0, prevTotal - prevLost);
+          const newTotal = prevTotal + 1;
+          const newLost = prevLost + (isLoss ? 1 : 0);
+
+          lastPt.total_pkts = newTotal;
+          lastPt.lost_pkts = newLost;
+          lastPt.loss_pct = Math.round((newLost / newTotal) * 1000) / 10;
+          if (isLoss) {
+            lastPt.loss = 100.0;
+          } else if (lastPt.ms === null || prevValid === 0) {
+            lastPt.ms = msVal;
+            lastPt.max_ms = msVal;
+            lastPt.min_ms = msVal;
+          } else {
+            lastPt.ms = Math.round(((lastPt.ms * prevValid + msVal) / (prevValid + 1)) * 100) / 100;
+            lastPt.max_ms = lastPt.max_ms !== null ? Math.max(lastPt.max_ms, msVal) : msVal;
+            lastPt.min_ms = lastPt.min_ms !== null ? Math.min(lastPt.min_ms, msVal) : msVal;
+          }
+        } else if (!lastPt || bucketTs > lastPt.ts) {
+          seriesArr.push({
+            ts: bucketTs,
+            ms: msVal,
+            max_ms: msVal,
+            min_ms: msVal,
+            loss: isLoss ? 100.0 : 0.0,
+            loss_pct: isLoss ? 100.0 : 0.0,
+            lost_pkts: isLoss ? 1 : 0,
+            total_pkts: 1,
+          });
+        }
+
         while (seriesArr.length > 0 && seriesArr[0].ts < cutoffTs) {
           seriesArr.shift();
         }
@@ -1007,7 +1115,13 @@ function bindEvents() {
   });
 
   document.getElementById('btnResetZoom').addEventListener('click', () => {
-    if (state.chart) state.chart.resetZoom();
+    state.isZoomed = false;
+    if (state.chart) {
+      delete state.chart.options.scales.x.min;
+      delete state.chart.options.scales.x.max;
+      state.chart.resetZoom('none');
+      renderTimelineChart();
+    }
   });
 
   elSelectInterval.addEventListener('change', async (e) => {

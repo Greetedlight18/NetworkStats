@@ -852,19 +852,20 @@ def get_target_history(
 ) -> Dict[str, Any]:
     """
     Retrieve time-series metrics for the requested target and time window.
-    For the final hop, includes all final-hop probes even if round-robin DNS changed the IP.
+    Includes avg, peak (max_ms), min_ms, and exact packet loss counts per bucket
+    so latency spikes never shrink when switching to wider time windows.
     """
     now = int(time.time())
     since_ts = now - window_seconds
 
-    if window_seconds <= 1800:      # <= 30m: raw 1s samples
+    if window_seconds <= 900:       # 5m, 15m: raw 1s samples
         bucket_sec = 1
-    elif window_seconds <= 3600:    # 1h: 5s buckets
-        bucket_sec = 5
-    elif window_seconds <= 21600:   # 6h: 30s buckets
-        bucket_sec = 30
-    else:                           # 24h+: 120s buckets
-        bucket_sec = 120
+    elif window_seconds <= 3600:    # 1h: 10s buckets
+        bucket_sec = 10
+    elif window_seconds <= 21600:   # 6h: 60s buckets
+        bucket_sec = 60
+    else:                           # 24h+: 240s buckets
+        bucket_sec = 240
 
     with get_db_connection() as conn:
         hop_rows = conn.execute(
@@ -872,7 +873,13 @@ def get_target_history(
             (target_id,),
         ).fetchall()
         if not hop_rows:
-            return {"target_id": target_id, "window_seconds": window_seconds, "series": {}}
+            return {
+                "target_id": target_id,
+                "window_seconds": window_seconds,
+                "bucket_sec": bucket_sec,
+                "server_now": now,
+                "series": {},
+            }
 
         max_hop_num = hop_rows[-1]["hop_num"]
         hop_ip_map = {r["hop_num"]: r["ip_address"] for r in hop_rows}
@@ -887,66 +894,56 @@ def get_target_history(
                 continue
 
             is_final = h_num == max_hop_num
+            filter_col = "hop_num >= ?" if is_final else "ip_address = ?"
+            filter_val: Any = max_hop_num if is_final else ip_addr
 
-            if is_final:
-                if bucket_sec == 1:
-                    rows = conn.execute(
-                        """
-                        SELECT timestamp AS bucket_ts,
-                               ROUND(AVG(latency_ms), 2) AS latency_ms,
-                               CASE WHEN MAX(is_loss) = 1 THEN 100.0 ELSE 0.0 END AS loss_pct
-                        FROM hop_metrics
-                        WHERE target_id = ? AND hop_num >= ? AND timestamp >= ?
-                        GROUP BY timestamp
-                        ORDER BY timestamp ASC
-                        """,
-                        (target_id, max_hop_num, since_ts),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT (timestamp / ?) * ? AS bucket_ts,
-                               ROUND(AVG(latency_ms), 2) AS latency_ms,
-                               CASE WHEN MAX(is_loss) = 1 THEN 100.0 ELSE 0.0 END AS loss_pct
-                        FROM hop_metrics
-                        WHERE target_id = ? AND hop_num >= ? AND timestamp >= ?
-                        GROUP BY bucket_ts
-                        ORDER BY bucket_ts ASC
-                        """,
-                        (bucket_sec, bucket_sec, target_id, max_hop_num, since_ts),
-                    ).fetchall()
+            if bucket_sec == 1:
+                rows = conn.execute(
+                    f"""
+                    SELECT timestamp AS bucket_ts,
+                           ROUND(AVG(latency_ms), 2) AS latency_ms,
+                           ROUND(MAX(latency_ms), 2) AS max_ms,
+                           ROUND(MIN(latency_ms), 2) AS min_ms,
+                           CASE WHEN MAX(is_loss) = 1 THEN 100.0 ELSE 0.0 END AS loss_flag,
+                           ROUND(AVG(is_loss) * 100.0, 1) AS loss_pct,
+                           COALESCE(SUM(is_loss), 0) AS lost_pkts,
+                           COUNT(*) AS total_pkts
+                    FROM hop_metrics
+                    WHERE target_id = ? AND {filter_col} AND timestamp >= ?
+                    GROUP BY timestamp
+                    ORDER BY timestamp ASC
+                    """,
+                    (target_id, filter_val, since_ts),
+                ).fetchall()
             else:
-                if bucket_sec == 1:
-                    rows = conn.execute(
-                        """
-                        SELECT timestamp AS bucket_ts,
-                               latency_ms AS latency_ms,
-                               CASE WHEN is_loss = 1 THEN 100.0 ELSE 0.0 END AS loss_pct
-                        FROM hop_metrics
-                        WHERE target_id = ? AND ip_address = ? AND timestamp >= ?
-                        ORDER BY timestamp ASC
-                        """,
-                        (target_id, ip_addr, since_ts),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT (timestamp / ?) * ? AS bucket_ts,
-                               ROUND(AVG(latency_ms), 2) AS latency_ms,
-                               CASE WHEN MAX(is_loss) = 1 THEN 100.0 ELSE 0.0 END AS loss_pct
-                        FROM hop_metrics
-                        WHERE target_id = ? AND ip_address = ? AND timestamp >= ?
-                        GROUP BY bucket_ts
-                        ORDER BY bucket_ts ASC
-                        """,
-                        (bucket_sec, bucket_sec, target_id, ip_addr, since_ts),
-                    ).fetchall()
+                rows = conn.execute(
+                    f"""
+                    SELECT (timestamp / ?) * ? AS bucket_ts,
+                           ROUND(AVG(latency_ms), 2) AS latency_ms,
+                           ROUND(MAX(latency_ms), 2) AS max_ms,
+                           ROUND(MIN(latency_ms), 2) AS min_ms,
+                           CASE WHEN MAX(is_loss) = 1 THEN 100.0 ELSE 0.0 END AS loss_flag,
+                           ROUND(AVG(is_loss) * 100.0, 1) AS loss_pct,
+                           COALESCE(SUM(is_loss), 0) AS lost_pkts,
+                           COUNT(*) AS total_pkts
+                    FROM hop_metrics
+                    WHERE target_id = ? AND {filter_col} AND timestamp >= ?
+                    GROUP BY bucket_ts
+                    ORDER BY bucket_ts ASC
+                    """,
+                    (bucket_sec, bucket_sec, target_id, filter_val, since_ts),
+                ).fetchall()
 
             series[str(h_num)] = [
                 {
                     "ts": r["bucket_ts"],
                     "ms": r["latency_ms"],
-                    "loss": r["loss_pct"],
+                    "max_ms": r["max_ms"],
+                    "min_ms": r["min_ms"],
+                    "loss": r["loss_flag"],
+                    "loss_pct": r["loss_pct"],
+                    "lost_pkts": int(r["lost_pkts"]),
+                    "total_pkts": int(r["total_pkts"]),
                 }
                 for r in rows
             ]
@@ -955,6 +952,7 @@ def get_target_history(
             "target_id": target_id,
             "window_seconds": window_seconds,
             "bucket_sec": bucket_sec,
+            "server_now": now,
             "series": series,
         }
 
