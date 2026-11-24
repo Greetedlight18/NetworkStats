@@ -18,6 +18,14 @@ RETENTION_HOURS = int(os.getenv("RETENTION_HOURS", "48"))
 LOSS_RETENTION_DAYS = int(os.getenv("LOSS_RETENTION_DAYS", "365"))
 DEFAULT_INTERVAL = float(os.getenv("PROBE_INTERVAL", "1.0"))
 
+VALID_SPEEDTEST_MODES = ("eco", "eco_download_only", "balanced")
+DEFAULT_SPEEDTEST_ENABLED = (
+    os.getenv("SPEEDTEST_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+)
+DEFAULT_SPEEDTEST_INTERVAL_MIN = max(5, min(1440, int(os.getenv("SPEEDTEST_INTERVAL_MIN", "60"))))
+_RAW_SPEEDTEST_MODE = os.getenv("SPEEDTEST_MODE", "eco").strip().lower()
+DEFAULT_SPEEDTEST_MODE = _RAW_SPEEDTEST_MODE if _RAW_SPEEDTEST_MODE in VALID_SPEEDTEST_MODES else "eco"
+
 DEFAULT_TARGETS = [
     {"host": "10.0.0.1", "label": "Local Gateway", "interval_sec": DEFAULT_INTERVAL},
     {"host": "1.1.1.1", "label": "Cloudflare DNS", "interval_sec": DEFAULT_INTERVAL},
@@ -360,6 +368,22 @@ def init_db() -> None:
                 affected_labels TEXT NOT NULL DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS speedtest_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                download_mbps REAL,
+                upload_mbps REAL,
+                ping_ms REAL,
+                jitter_ms REAL,
+                bytes_used INTEGER NOT NULL DEFAULT 0,
+                duration_sec REAL NOT NULL DEFAULT 0.0,
+                mode TEXT NOT NULL DEFAULT 'eco',
+                server_location TEXT NOT NULL DEFAULT '',
+                trigger TEXT NOT NULL DEFAULT 'scheduled',
+                status TEXT NOT NULL DEFAULT 'ok',
+                error_message TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_hop_metrics_target_ts
                 ON hop_metrics(target_id, timestamp);
 
@@ -380,6 +404,9 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_network_outages_start
                 ON network_outages(start_ts DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_speedtest_results_ts
+                ON speedtest_results(timestamp DESC);
             """
         )
 
@@ -1087,7 +1114,267 @@ def prune_old_metrics(batch_size: int = 5000, max_batches: int = 20) -> int:
     with get_db_connection() as conn:
         conn.execute("DELETE FROM loss_events WHERE end_ts < ?", (loss_cutoff,))
         conn.execute("DELETE FROM network_outages WHERE end_ts < ?", (loss_cutoff,))
+        conn.execute("DELETE FROM speedtest_results WHERE timestamp < ?", (loss_cutoff,))
 
     if total_deleted > 0:
         logger.info("Pruned %d historical metric rows older than %d hours", total_deleted, RETENTION_HOURS)
     return total_deleted
+
+
+def _speedtest_row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    return {
+        "id": int(row["id"]),
+        "timestamp": int(row["timestamp"]),
+        "download_mbps": row["download_mbps"],
+        "upload_mbps": row["upload_mbps"],
+        "ping_ms": row["ping_ms"],
+        "jitter_ms": row["jitter_ms"],
+        "bytes_used": int(row["bytes_used"]),
+        "duration_sec": float(row["duration_sec"]),
+        "mode": row["mode"],
+        "server_location": row["server_location"],
+        "trigger": row["trigger"],
+        "status": row["status"],
+        "error_message": row["error_message"],
+    }
+
+
+def _round_opt(val: Any, digits: int = 2) -> Optional[float]:
+    if val is None:
+        return None
+    return round(float(val), digits)
+
+
+def get_speedtest_settings() -> Dict[str, Any]:
+    """Read speedtest settings from app_meta with environment defaults."""
+    enabled = DEFAULT_SPEEDTEST_ENABLED
+    interval_min = DEFAULT_SPEEDTEST_INTERVAL_MIN
+    mode = DEFAULT_SPEEDTEST_MODE
+
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT key, value FROM app_meta
+            WHERE key IN ('speedtest_enabled', 'speedtest_interval_min', 'speedtest_mode')
+            """
+        ).fetchall()
+
+    meta = {r["key"]: r["value"] for r in rows}
+    if "speedtest_enabled" in meta:
+        enabled = meta["speedtest_enabled"].strip().lower() not in ("0", "false", "no", "off")
+    if "speedtest_interval_min" in meta:
+        try:
+            interval_min = max(5, min(1440, int(meta["speedtest_interval_min"])))
+        except ValueError:
+            pass
+    if "speedtest_mode" in meta:
+        cand = meta["speedtest_mode"].strip().lower()
+        if cand in VALID_SPEEDTEST_MODES:
+            mode = cand
+
+    return {
+        "enabled": enabled,
+        "interval_min": interval_min,
+        "mode": mode,
+    }
+
+
+def update_speedtest_settings(
+    enabled: Optional[bool] = None,
+    interval_min: Optional[int] = None,
+    mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate and persist speedtest settings into app_meta."""
+    updates: List[tuple] = []
+
+    if enabled is not None:
+        updates.append(("speedtest_enabled", "1" if bool(enabled) else "0"))
+
+    if interval_min is not None:
+        try:
+            iv = int(interval_min)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("interval_min must be an integer between 5 and 1440") from exc
+        if iv < 5 or iv > 1440:
+            raise ValueError("interval_min must be between 5 and 1440 minutes")
+        updates.append(("speedtest_interval_min", str(iv)))
+
+    if mode is not None:
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in VALID_SPEEDTEST_MODES:
+            raise ValueError(f"mode must be one of {VALID_SPEEDTEST_MODES}")
+        updates.append(("speedtest_mode", normalized_mode))
+
+    if updates:
+        with get_db_connection() as conn:
+            for key, val in updates:
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)",
+                    (key, val),
+                )
+
+    return get_speedtest_settings()
+
+
+def save_speedtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Insert a completed or failed speedtest measurement and return the saved record."""
+    ts = int(result.get("timestamp") or time.time())
+    dl = result.get("download_mbps")
+    ul = result.get("upload_mbps")
+    ping_ms = result.get("ping_ms")
+    jitter_ms = result.get("jitter_ms")
+    bytes_used = int(result.get("bytes_used") or 0)
+    duration_sec = float(result.get("duration_sec") or 0.0)
+    mode = str(result.get("mode") or DEFAULT_SPEEDTEST_MODE)
+    server_location = str(result.get("server_location") or "")
+    trigger = str(result.get("trigger") or "scheduled")
+    status = str(result.get("status") or "ok")
+    error_message = result.get("error_message")
+
+    with get_db_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO speedtest_results (
+                timestamp, download_mbps, upload_mbps, ping_ms, jitter_ms,
+                bytes_used, duration_sec, mode, server_location, trigger,
+                status, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                dl,
+                ul,
+                ping_ms,
+                jitter_ms,
+                bytes_used,
+                duration_sec,
+                mode,
+                server_location,
+                trigger,
+                status,
+                error_message,
+            ),
+        )
+        new_id = int(cur.lastrowid)
+
+    return {
+        "id": new_id,
+        "timestamp": ts,
+        "download_mbps": dl,
+        "upload_mbps": ul,
+        "ping_ms": ping_ms,
+        "jitter_ms": jitter_ms,
+        "bytes_used": bytes_used,
+        "duration_sec": duration_sec,
+        "mode": mode,
+        "server_location": server_location,
+        "trigger": trigger,
+        "status": status,
+        "error_message": error_message,
+    }
+
+
+def get_latest_speedtest_ts() -> Optional[int]:
+    """Return the timestamp of the most recent speedtest run, or None if none exist."""
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT MAX(timestamp) AS max_ts FROM speedtest_results").fetchone()
+    if not row or row["max_ts"] is None:
+        return None
+    return int(row["max_ts"])
+
+
+def get_speedtest_history(window_seconds: int = 0, limit: int = 500) -> Dict[str, Any]:
+    """Query speedtest results and summary statistics within an optional time window."""
+    now = int(time.time())
+    since_ts = (now - window_seconds) if window_seconds > 0 else 0
+
+    where_sql = "WHERE timestamp >= ?" if since_ts > 0 else ""
+    params: List[Any] = [since_ts] if since_ts > 0 else []
+
+    with get_db_connection() as conn:
+        agg_row = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_runs,
+                COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) AS successful_runs,
+                COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END), 0) AS failed_runs,
+                AVG(CASE WHEN status = 'ok' THEN download_mbps END) AS avg_dl,
+                MIN(CASE WHEN status = 'ok' THEN download_mbps END) AS min_dl,
+                MAX(CASE WHEN status = 'ok' THEN download_mbps END) AS max_dl,
+                AVG(CASE WHEN status = 'ok' THEN upload_mbps END) AS avg_ul,
+                MIN(CASE WHEN status = 'ok' THEN upload_mbps END) AS min_ul,
+                MAX(CASE WHEN status = 'ok' THEN upload_mbps END) AS max_ul,
+                AVG(CASE WHEN status = 'ok' THEN ping_ms END) AS avg_ping,
+                COALESCE(SUM(bytes_used), 0) AS total_bytes_used
+            FROM speedtest_results
+            {where_sql}
+            """,
+            params,
+        ).fetchone()
+
+        rows = conn.execute(
+            f"""
+            SELECT id, timestamp, download_mbps, upload_mbps, ping_ms, jitter_ms,
+                   bytes_used, duration_sec, mode, server_location, trigger,
+                   status, error_message
+            FROM speedtest_results
+            {where_sql}
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+
+        latest_row = conn.execute(
+            """
+            SELECT id, timestamp, download_mbps, upload_mbps, ping_ms, jitter_ms,
+                   bytes_used, duration_sec, mode, server_location, trigger,
+                   status, error_message
+            FROM speedtest_results
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        latest_ok_row = conn.execute(
+            """
+            SELECT id, timestamp, download_mbps, upload_mbps, ping_ms, jitter_ms,
+                   bytes_used, duration_sec, mode, server_location, trigger,
+                   status, error_message
+            FROM speedtest_results
+            WHERE status = 'ok'
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    results = [_speedtest_row_to_dict(r) for r in rows]
+    summary = {
+        "total_runs": int(agg_row["total_runs"]) if agg_row else 0,
+        "successful_runs": int(agg_row["successful_runs"]) if agg_row else 0,
+        "failed_runs": int(agg_row["failed_runs"]) if agg_row else 0,
+        "avg_download_mbps": _round_opt(agg_row["avg_dl"] if agg_row else None, 2),
+        "min_download_mbps": _round_opt(agg_row["min_dl"] if agg_row else None, 2),
+        "max_download_mbps": _round_opt(agg_row["max_dl"] if agg_row else None, 2),
+        "avg_upload_mbps": _round_opt(agg_row["avg_ul"] if agg_row else None, 2),
+        "min_upload_mbps": _round_opt(agg_row["min_ul"] if agg_row else None, 2),
+        "max_upload_mbps": _round_opt(agg_row["max_ul"] if agg_row else None, 2),
+        "avg_ping_ms": _round_opt(agg_row["avg_ping"] if agg_row else None, 2),
+        "total_bytes_used": int(agg_row["total_bytes_used"]) if agg_row else 0,
+    }
+
+    return {
+        "results": results,
+        "summary": summary,
+        "latest": _speedtest_row_to_dict(latest_row),
+        "latest_ok": _speedtest_row_to_dict(latest_ok_row),
+    }
+
+
+def clear_speedtest_results() -> int:
+    """Delete all stored speedtest results and return the number of rows removed."""
+    with get_db_connection() as conn:
+        cur = conn.execute("DELETE FROM speedtest_results")
+        return int(cur.rowcount)

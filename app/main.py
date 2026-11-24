@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from app import database
 from app.monitor import MonitorEngine
+from app.speedtest import SpeedtestScheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +66,7 @@ class ConnectionManager:
 
 ws_manager = ConnectionManager()
 monitor_engine = MonitorEngine(broadcast_cb=ws_manager.broadcast)
+speedtest_scheduler = SpeedtestScheduler(broadcast_cb=ws_manager.broadcast)
 
 
 @asynccontextmanager
@@ -73,15 +75,17 @@ async def lifespan(app: FastAPI):
     await database.run_db_write(database.init_db)
     await database.run_db_write(database.prune_old_metrics)
     await monitor_engine.start()
+    await speedtest_scheduler.start()
     yield
     logger.info("Shutting down NetworkStats Server...")
+    await speedtest_scheduler.stop()
     await monitor_engine.stop()
 
 
 app = FastAPI(
     title="NetworkStats",
     description="Self-Hosted 24/7 Network Monitoring and Visual Traceroute Web Application",
-    version="1.3.1",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -120,6 +124,12 @@ class TargetUpdateRequest(BaseModel):
     enabled: Optional[bool] = Field(default=None)
 
 
+class SpeedtestSettingsRequest(BaseModel):
+    enabled: Optional[bool] = Field(default=None)
+    interval_min: Optional[int] = Field(default=None, ge=5, le=1440)
+    mode: Optional[str] = Field(default=None)
+
+
 @app.get("/", include_in_schema=False)
 async def serve_index():
     return FileResponse(str(STATIC_DIR / "index.html"))
@@ -135,6 +145,7 @@ async def health_check():
         "active_workers": len(monitor_engine._tasks),
         "last_probe_ts": last_ts,
         "seconds_since_last_probe": (now - last_ts) if last_ts else None,
+        "speedtest_is_running": speedtest_scheduler.is_running,
     }
 
 
@@ -266,6 +277,64 @@ async def api_clear_loss_events(
 ):
     await database.run_db_write(database.clear_loss_events, target_id)
     asyncio.create_task(ws_manager.broadcast({"type": "loss_update"}))
+    return {"cleared": True}
+
+
+@app.get("/api/speedtest/status")
+async def api_speedtest_status():
+    settings = await database.run_db_read(database.get_speedtest_settings)
+    history = await database.run_db_read(database.get_speedtest_history, 0, 1)
+    return {
+        "status": speedtest_scheduler.get_status(settings),
+        "latest": history["latest"],
+        "latest_ok": history["latest_ok"],
+    }
+
+
+@app.patch("/api/speedtest/settings")
+async def api_update_speedtest_settings(req: SpeedtestSettingsRequest):
+    try:
+        updated = await database.run_db_write(
+            database.update_speedtest_settings,
+            req.enabled,
+            req.interval_min,
+            req.mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    speedtest_scheduler.on_settings_updated(updated)
+    status = speedtest_scheduler.get_status(updated)
+    asyncio.create_task(ws_manager.broadcast({"type": "speedtest_status", "status": status}))
+    return {"status": status}
+
+
+@app.post("/api/speedtest/run", status_code=202)
+async def api_run_speedtest():
+    started = speedtest_scheduler.trigger_manual_run()
+    if not started:
+        raise HTTPException(status_code=409, detail="A speedtest is already in progress.")
+    settings = await database.run_db_read(database.get_speedtest_settings)
+    return {"started": True, "status": speedtest_scheduler.get_status(settings)}
+
+
+@app.get("/api/speedtest/history")
+async def api_speedtest_history(
+    window: int = Query(default=86400, ge=0, le=31536000, description="Time window in seconds (0 = all time)"),
+    limit: int = Query(default=500, ge=1, le=2000),
+):
+    settings = await database.run_db_read(database.get_speedtest_settings)
+    history = await database.run_db_read(database.get_speedtest_history, window, limit)
+    return {**history, "status": speedtest_scheduler.get_status(settings)}
+
+
+@app.delete("/api/speedtest/history")
+async def api_clear_speedtest_history():
+    await database.run_db_write(database.clear_speedtest_results)
+    speedtest_scheduler.last_run_ts = None
+    settings = await database.run_db_read(database.get_speedtest_settings)
+    speedtest_scheduler.on_settings_updated(settings)
+    asyncio.create_task(ws_manager.broadcast({"type": "speedtest_cleared"}))
     return {"cleared": True}
 
 

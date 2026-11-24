@@ -66,6 +66,10 @@
           <span>Packet Loss Log</span>
           <span id="lossLogBadge" class="hidden px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-rose-500/20 text-rose-400 border border-rose-500/30">0</span>
         </button>
+        <button id="tabBtnSpeedtest" class="px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 whitespace-nowrap transition">
+          <span>Speedtest</span>
+          <span id="speedtestNavBadge" class="hidden px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">--</span>
+        </button>
       </nav>
     </div>
 
@@ -284,6 +288,127 @@
       </div>
     </main>
 
+    <!-- ================================================================== -->
+    <!-- VIEW 3: LOW-IMPACT SCHEDULED SPEEDTEST MONITOR                     -->
+    <!-- ================================================================== -->
+    <main id="viewSpeedtest" class="hidden flex-1 flex-col overflow-hidden bg-slate-950 min-w-0">
+      <div class="min-h-[2.75rem] py-2 bg-slate-900/50 border-b border-slate-800/80 px-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 shrink-0">
+        <div class="flex flex-wrap items-center gap-x-3 gap-y-1 whitespace-nowrap">
+          <span class="font-medium text-sm text-white">Speedtest Monitor</span>
+          <span id="speedtestStatusText" class="px-2 py-0.5 rounded-full text-[11px] font-mono bg-slate-900 text-slate-300 border border-slate-800">
+            Initializing...
+          </span>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2 whitespace-nowrap">
+          <label class="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-xs text-slate-200 cursor-pointer">
+            <input id="toggleSpeedtestEnabled" type="checkbox" checked class="rounded bg-slate-950 border-slate-700 text-cyan-500 focus:ring-0" />
+            <span>Auto</span>
+          </label>
+
+          <div class="flex items-center space-x-1.5 bg-slate-900 border border-slate-800 rounded px-2 py-0.5 text-xs">
+            <span class="text-slate-400">Every</span>
+            <input id="inputSpeedtestInterval" type="number" min="5" max="1440" step="1" value="60"
+              class="w-14 bg-transparent text-xs font-mono text-cyan-400 text-center focus:outline-none" />
+            <span class="text-slate-400">min</span>
+          </div>
+
+          <select id="selectSpeedtestMode" class="bg-slate-900 border border-slate-800 rounded px-2.5 py-1 text-xs text-slate-200 focus:outline-none">
+            <option value="eco">Eco (Low Impact)</option>
+            <option value="eco_download_only">Eco (Download Only)</option>
+            <option value="balanced">Balanced (Gigabit)</option>
+          </select>
+
+          <button id="btnSaveSpeedtestSettings" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 text-xs transition">
+            Save
+          </button>
+
+          <button id="btnRunSpeedtestNow" class="px-3 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-medium text-xs transition disabled:opacity-50 disabled:cursor-not-allowed">
+            Run Now
+          </button>
+
+          <select id="selectSpeedtestWindow" class="bg-slate-900 border border-slate-800 rounded px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none">
+            <option value="86400" selected>Last 24h</option>
+            <option value="604800">Last 7 Days</option>
+            <option value="2592000">Last 30 Days</option>
+            <option value="0">All Time</option>
+          </select>
+
+          <button id="btnClearSpeedtestHistory" class="px-2.5 py-1 rounded bg-slate-900 hover:bg-rose-950/60 text-rose-400 border border-slate-800 hover:border-rose-800/60 text-xs transition">
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 overflow-auto p-4 space-y-4">
+        <!-- 4 KPI Summary Cards -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <div class="bg-slate-925/80 border border-slate-800/80 rounded-xl p-3.5">
+            <div class="text-[11px] uppercase tracking-wider text-slate-400">Latest Download</div>
+            <div id="stLatestDownload" class="text-xl font-mono font-semibold text-cyan-300 mt-1">-- Mbps</div>
+            <div id="stDownloadStats" class="text-[11px] font-mono text-slate-500 mt-1">Avg -- &middot; Min --</div>
+          </div>
+
+          <div class="bg-slate-925/80 border border-slate-800/80 rounded-xl p-3.5">
+            <div class="text-[11px] uppercase tracking-wider text-slate-400">Latest Upload</div>
+            <div id="stLatestUpload" class="text-xl font-mono font-semibold text-purple-300 mt-1">-- Mbps</div>
+            <div id="stUploadStats" class="text-[11px] font-mono text-slate-500 mt-1">Avg -- &middot; Min --</div>
+          </div>
+
+          <div class="bg-slate-925/80 border border-slate-800/80 rounded-xl p-3.5">
+            <div class="text-[11px] uppercase tracking-wider text-slate-400">Idle Ping &amp; Jitter</div>
+            <div id="stLatestPing" class="text-xl font-mono font-semibold text-emerald-300 mt-1">-- ms</div>
+            <div id="stServerInfo" class="text-[11px] font-mono text-slate-500 mt-1 truncate">Jitter -- &middot; --</div>
+          </div>
+
+          <div class="bg-slate-925/80 border border-slate-800/80 rounded-xl p-3.5">
+            <div class="text-[11px] uppercase tracking-wider text-slate-400">Data Per Check</div>
+            <div id="stLatestData" class="text-xl font-mono font-semibold text-slate-100 mt-1">-- MB</div>
+            <div id="stModeSummary" class="text-[11px] text-slate-500 mt-1 truncate">Eco (Low Impact)</div>
+          </div>
+        </div>
+
+        <!-- Speed History Chart -->
+        <section class="bg-slate-925/60 border border-slate-800/80 rounded-xl overflow-hidden">
+          <div class="px-4 py-2 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-2 bg-slate-925">
+            <span class="text-xs font-medium text-slate-200">Speed History (Mbps)</span>
+            <span id="stWindowBytesSummary" class="text-[11px] font-mono text-slate-400">0 runs &middot; 0 B used</span>
+          </div>
+          <div class="h-64 sm:h-72 relative p-3">
+            <canvas id="speedtestChart"></canvas>
+          </div>
+        </section>
+
+        <!-- Speedtest Results Table -->
+        <section class="bg-slate-925/60 border border-slate-800/80 rounded-xl overflow-hidden">
+          <div class="px-4 py-2 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-2 bg-slate-925">
+            <span class="text-xs font-semibold uppercase tracking-wider text-slate-300">Recent Checks</span>
+            <span class="text-[11px] text-slate-500">Adaptive single-stream short burst (~15-35 MB) minimizes LAN impact</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse whitespace-nowrap">
+              <thead class="bg-slate-925/50 border-b border-slate-800/60 text-[11px] font-medium text-slate-400">
+                <tr>
+                  <th class="py-2 px-4">When</th>
+                  <th class="py-2 px-3">Ago</th>
+                  <th class="py-2 px-3 text-right">Download</th>
+                  <th class="py-2 px-3 text-right">Upload</th>
+                  <th class="py-2 px-3 text-right">Ping</th>
+                  <th class="py-2 px-3 text-right">Data Used</th>
+                  <th class="py-2 px-3 text-right">Duration</th>
+                  <th class="py-2 px-3">Mode / Server</th>
+                  <th class="py-2 px-4">Trigger</th>
+                </tr>
+              </thead>
+              <tbody id="speedtestTableBody" class="divide-y divide-slate-800/40 text-xs font-mono">
+                <!-- Populated by app.js -->
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </main>
+
   </div>
 
   <!-- Add Target Modal -->
@@ -327,6 +452,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=1.3.1"></script>
+  <script src="/static/app.js?v=1.4.0"></script>
 </body>
 </html>

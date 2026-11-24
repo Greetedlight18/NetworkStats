@@ -33,6 +33,14 @@ const state = {
   lossRefreshTimer: null,
   lastLossRefreshAt: 0,
   chart: null,
+  speedtestChart: null,
+  speedtestStatus: null,
+  speedtestHistory: [],
+  speedtestSummary: null,
+  speedtestLatest: null,
+  speedtestLatestOk: null,
+  speedtestSettingsDirty: false,
+  speedtestStatusTimer: null,
 };
 
 // DOM Elements
@@ -56,9 +64,12 @@ const elWsDisconnectBanner = document.getElementById('wsDisconnectBanner');
 // View & Tab Elements
 const elTabBtnLive = document.getElementById('tabBtnLive');
 const elTabBtnLossLog = document.getElementById('tabBtnLossLog');
+const elTabBtnSpeedtest = document.getElementById('tabBtnSpeedtest');
 const elLossLogBadge = document.getElementById('lossLogBadge');
+const elSpeedtestNavBadge = document.getElementById('speedtestNavBadge');
 const elViewLive = document.getElementById('viewLiveMonitor');
 const elViewLossLog = document.getElementById('viewLossLog');
+const elViewSpeedtest = document.getElementById('viewSpeedtest');
 const elOutagesTableBody = document.getElementById('outagesTableBody');
 const elLossLogTableBody = document.getElementById('lossLogTableBody');
 const elLossLogTotalOutages = document.getElementById('lossLogTotalOutages');
@@ -67,6 +78,32 @@ const elLossLogTotalPackets = document.getElementById('lossLogTotalPackets');
 const elSelectLossTargetFilter = document.getElementById('selectLossTargetFilter');
 const elSelectLossWindowFilter = document.getElementById('selectLossWindowFilter');
 const elBtnClearLossLog = document.getElementById('btnClearLossLog');
+
+// Speedtest Elements
+const elSpeedtestStatusText = document.getElementById('speedtestStatusText');
+const elToggleSpeedtestEnabled = document.getElementById('toggleSpeedtestEnabled');
+const elInputSpeedtestInterval = document.getElementById('inputSpeedtestInterval');
+const elSelectSpeedtestMode = document.getElementById('selectSpeedtestMode');
+const elBtnSaveSpeedtestSettings = document.getElementById('btnSaveSpeedtestSettings');
+const elBtnRunSpeedtestNow = document.getElementById('btnRunSpeedtestNow');
+const elSelectSpeedtestWindow = document.getElementById('selectSpeedtestWindow');
+const elBtnClearSpeedtestHistory = document.getElementById('btnClearSpeedtestHistory');
+const elStLatestDownload = document.getElementById('stLatestDownload');
+const elStDownloadStats = document.getElementById('stDownloadStats');
+const elStLatestUpload = document.getElementById('stLatestUpload');
+const elStUploadStats = document.getElementById('stUploadStats');
+const elStLatestPing = document.getElementById('stLatestPing');
+const elStServerInfo = document.getElementById('stServerInfo');
+const elStLatestData = document.getElementById('stLatestData');
+const elStModeSummary = document.getElementById('stModeSummary');
+const elStWindowBytesSummary = document.getElementById('stWindowBytesSummary');
+const elSpeedtestTableBody = document.getElementById('speedtestTableBody');
+
+const SPEEDTEST_MODE_LABELS = {
+  eco: 'Eco (Low Impact)',
+  eco_download_only: 'Eco (DL Only)',
+  balanced: 'Balanced (Gigabit)',
+};
 
 // Modal Elements
 const elAddModal = document.getElementById('addTargetModal');
@@ -134,28 +171,49 @@ function formatDuration(sec) {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
+function formatBytesMb(bytes) {
+  const b = Number(bytes || 0);
+  if (b <= 0) return '0 B';
+  if (b < 1024 * 1024) return `${Math.round(b / 1024)} KB`;
+  const mb = b / (1024 * 1024);
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+  return `${mb.toFixed(1)} MB`;
+}
+
 // ============================================================================
 // Tab Switching
 // ============================================================================
 function switchTab(tabName) {
   state.activeTab = tabName;
+  const inactiveCls =
+    'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 whitespace-nowrap transition';
+  const activeCls =
+    'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white flex items-center space-x-1.5 whitespace-nowrap transition';
+
+  elTabBtnLive.className = tabName === 'live' ? activeCls : inactiveCls;
+  elTabBtnLossLog.className = tabName === 'losslog' ? activeCls : inactiveCls;
+  if (elTabBtnSpeedtest) {
+    elTabBtnSpeedtest.className = tabName === 'speedtest' ? activeCls : inactiveCls;
+  }
+
+  elViewLive.classList.toggle('hidden', tabName !== 'live');
+  elViewLive.classList.toggle('flex', tabName === 'live');
+  elViewLossLog.classList.toggle('hidden', tabName !== 'losslog');
+  elViewLossLog.classList.toggle('flex', tabName === 'losslog');
+  if (elViewSpeedtest) {
+    elViewSpeedtest.classList.toggle('hidden', tabName !== 'speedtest');
+    elViewSpeedtest.classList.toggle('flex', tabName === 'speedtest');
+  }
+
   if (tabName === 'live') {
-    elTabBtnLive.className = 'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white whitespace-nowrap transition';
-    elTabBtnLossLog.className =
-      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 flex items-center space-x-1.5 whitespace-nowrap transition';
-    elViewLive.classList.remove('hidden');
-    elViewLossLog.classList.add('hidden');
-    elViewLossLog.classList.remove('flex');
     renderTimelineChart();
-  } else {
-    elTabBtnLossLog.className =
-      'px-3 py-1 rounded-md text-xs font-medium bg-cyan-600 text-white flex items-center space-x-1.5 whitespace-nowrap transition';
-    elTabBtnLive.className =
-      'px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-slate-200 whitespace-nowrap transition';
-    elViewLive.classList.add('hidden');
-    elViewLossLog.classList.remove('hidden');
-    elViewLossLog.classList.add('flex');
+  } else if (tabName === 'losslog') {
     loadLossLog();
+  } else if (tabName === 'speedtest') {
+    if (!state.speedtestChart) {
+      initSpeedtestChart();
+    }
+    loadSpeedtestHistory();
   }
 }
 
@@ -173,7 +231,10 @@ function getTickStepSec(windowSec) {
   if (windowSec <= 7200) return 900;
   if (windowSec <= 14400) return 1800;
   if (windowSec <= 28800) return 3600;
-  return 14400;
+  if (windowSec <= 129600) return 14400;
+  if (windowSec <= 345600) return 43200;
+  if (windowSec <= 1036800) return 86400;
+  return 259200;
 }
 
 function initTimelineChart() {
@@ -913,6 +974,474 @@ function renderLossLogTable(data) {
 }
 
 // ============================================================================
+// Speedtest Chart, KPI Cards & Controller
+// ============================================================================
+function initSpeedtestChart() {
+  const canvas = document.getElementById('speedtestChart');
+  if (!canvas || state.speedtestChart) return;
+  const ctx = canvas.getContext('2d');
+
+  state.speedtestChart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: 'x', intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: '#94a3b8',
+            boxWidth: 10,
+            boxHeight: 10,
+            font: { family: 'ui-monospace, monospace', size: 11 },
+          },
+        },
+        tooltip: {
+          backgroundColor: 'rgba(12, 18, 30, 0.95)',
+          titleColor: '#f8fafc',
+          bodyColor: '#cbd5e1',
+          borderColor: '#1e293b',
+          borderWidth: 1,
+          titleFont: { family: 'ui-monospace, monospace', size: 11 },
+          bodyFont: { family: 'ui-monospace, monospace', size: 11 },
+          filter: (item) => item.parsed && item.parsed.y !== null,
+          callbacks: {
+            title: (items) =>
+              items.length > 0 ? formatTooltipTime(Math.round(items[0].parsed.x)) : '',
+            label: (item) => `${item.dataset.label}: ${Number(item.parsed.y).toFixed(1)} Mbps`,
+            afterBody: (items) => {
+              const raw = items[0]?.raw;
+              if (!raw || raw.pingMs === undefined) return '';
+              const pingStr = raw.pingMs !== null ? `${Number(raw.pingMs).toFixed(1)} ms` : '--';
+              const dataStr = formatBytesMb(raw.bytesUsed || 0);
+              const modeStr = SPEEDTEST_MODE_LABELS[raw.mode] || raw.mode || 'eco';
+              return `Ping: ${pingStr}  •  Data: ${dataStr}  •  ${modeStr}`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          bounds: 'data',
+          grace: 0,
+          grid: { color: 'rgba(30, 41, 59, 0.4)' },
+          afterBuildTicks: (axis) => {
+            const minSec = axis.min;
+            const maxSec = axis.max;
+            if (!Number.isFinite(minSec) || !Number.isFinite(maxSec) || maxSec <= minSec) {
+              return;
+            }
+            const stepSec = getTickStepSec(maxSec - minSec);
+            const tzOffsetSec = new Date(minSec * 1000).getTimezoneOffset() * 60;
+            const firstLocal = Math.ceil((minSec - tzOffsetSec) / stepSec) * stepSec;
+            const ticks = [];
+            for (let v = firstLocal + tzOffsetSec; v <= maxSec + 0.001; v += stepSec) {
+              ticks.push({ value: v });
+            }
+            axis.ticks = ticks;
+          },
+          ticks: {
+            color: '#64748b',
+            maxRotation: 0,
+            autoSkip: false,
+            callback(val) {
+              const span =
+                Number.isFinite(this?.max) && Number.isFinite(this?.min)
+                  ? Math.max(1, this.max - this.min)
+                  : 86400;
+              if (span > 129600) {
+                const d = new Date(Math.round(val) * 1000);
+                return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+              }
+              return formatTimeLabel(Math.round(val), span);
+            },
+            font: { family: 'ui-monospace, monospace', size: 10 },
+          },
+        },
+        ySpeed: {
+          type: 'linear',
+          position: 'left',
+          beginAtZero: true,
+          suggestedMax: 100,
+          grid: { color: 'rgba(30, 41, 59, 0.5)' },
+          ticks: {
+            color: '#94a3b8',
+            callback: (v) => `${v} Mbps`,
+            font: { family: 'ui-monospace, monospace', size: 10 },
+          },
+        },
+      },
+    },
+  });
+}
+
+function renderSpeedtestChart() {
+  if (!state.speedtestChart) return;
+  const okRows = (state.speedtestHistory || [])
+    .filter((r) => r.status === 'ok' && r.download_mbps !== null)
+    .slice()
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  const dlData = okRows.map((r) => ({
+    x: r.timestamp,
+    y: Number(r.download_mbps),
+    pingMs: r.ping_ms,
+    bytesUsed: r.bytes_used,
+    mode: r.mode,
+  }));
+
+  const ulData = okRows
+    .filter((r) => r.upload_mbps !== null && r.upload_mbps !== undefined)
+    .map((r) => ({
+      x: r.timestamp,
+      y: Number(r.upload_mbps),
+      pingMs: r.ping_ms,
+      bytesUsed: r.bytes_used,
+      mode: r.mode,
+    }));
+
+  const now = Math.floor(Date.now() / 1000);
+  if (okRows.length === 0) {
+    state.speedtestChart.options.scales.x.min = now - 86400;
+    state.speedtestChart.options.scales.x.max = now;
+  } else if (okRows.length === 1) {
+    state.speedtestChart.options.scales.x.min = okRows[0].timestamp - 1800;
+    state.speedtestChart.options.scales.x.max = okRows[0].timestamp + 1800;
+  } else {
+    const firstTs = okRows[0].timestamp;
+    const lastTs = okRows[okRows.length - 1].timestamp;
+    const pad = Math.max(60, Math.round((lastTs - firstTs) * 0.04));
+    state.speedtestChart.options.scales.x.min = firstTs - pad;
+    state.speedtestChart.options.scales.x.max = lastTs + pad;
+  }
+
+  state.speedtestChart.data.datasets = [
+    {
+      label: 'Download',
+      data: dlData,
+      borderColor: '#22d3ee',
+      backgroundColor: 'rgba(34, 211, 238, 0.12)',
+      fill: 'origin',
+      borderWidth: 2,
+      pointRadius: okRows.length <= 40 ? 3.5 : 2,
+      pointHoverRadius: 5,
+      tension: 0.25,
+    },
+    {
+      label: 'Upload',
+      data: ulData,
+      borderColor: '#a855f7',
+      backgroundColor: 'transparent',
+      fill: false,
+      borderWidth: 2,
+      pointRadius: okRows.length <= 40 ? 3.5 : 2,
+      pointHoverRadius: 5,
+      spanGaps: true,
+      tension: 0.25,
+    },
+  ];
+  state.speedtestChart.update('none');
+}
+
+function updateSpeedtestNavBadge() {
+  if (!elSpeedtestNavBadge) return;
+  const st = state.speedtestStatus;
+  if (st && st.is_running) {
+    elSpeedtestNavBadge.textContent = '...';
+    elSpeedtestNavBadge.className =
+      'px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-amber-500/20 text-amber-300 border border-amber-500/30 animate-pulse';
+    return;
+  }
+  const latestOk = state.speedtestLatestOk;
+  if (latestOk && latestOk.download_mbps !== null && latestOk.download_mbps !== undefined) {
+    elSpeedtestNavBadge.textContent = `${Math.round(Number(latestOk.download_mbps))}M`;
+    elSpeedtestNavBadge.className =
+      'px-1.5 py-0.2 rounded-full text-[10px] font-mono bg-cyan-500/15 text-cyan-300 border border-cyan-500/30';
+  } else {
+    elSpeedtestNavBadge.classList.add('hidden');
+  }
+}
+
+function updateSpeedtestStatusBanner() {
+  const st = state.speedtestStatus;
+  if (!st || !elSpeedtestStatusText) return;
+
+  if (!state.speedtestSettingsDirty) {
+    if (elToggleSpeedtestEnabled) elToggleSpeedtestEnabled.checked = Boolean(st.enabled);
+    if (elInputSpeedtestInterval) elInputSpeedtestInterval.value = String(st.interval_min || 60);
+    if (elSelectSpeedtestMode && st.mode) elSelectSpeedtestMode.value = st.mode;
+  }
+
+  if (elBtnRunSpeedtestNow) {
+    elBtnRunSpeedtestNow.disabled = Boolean(st.is_running);
+    elBtnRunSpeedtestNow.textContent = st.is_running ? 'Running...' : 'Run Now';
+  }
+
+  if (st.is_running) {
+    elSpeedtestStatusText.textContent =
+      st.active_trigger === 'manual' ? 'Running manual speedtest...' : 'Running scheduled speedtest...';
+    elSpeedtestStatusText.className =
+      'px-2 py-0.5 rounded-full text-[11px] font-mono bg-cyan-950/70 text-cyan-300 border border-cyan-700/60';
+  } else if (!st.enabled) {
+    elSpeedtestStatusText.textContent = 'Auto paused (manual only)';
+    elSpeedtestStatusText.className =
+      'px-2 py-0.5 rounded-full text-[11px] font-mono bg-slate-900 text-slate-400 border border-slate-800';
+  } else if (st.next_run_ts) {
+    const diffSec = Math.max(0, st.next_run_ts - Math.floor(Date.now() / 1000));
+    const etaStr =
+      diffSec < 60
+        ? `${diffSec}s`
+        : diffSec < 3600
+        ? `${Math.ceil(diffSec / 60)}m`
+        : `${Math.floor(diffSec / 3600)}h ${Math.floor((diffSec % 3600) / 60)}m`;
+    elSpeedtestStatusText.textContent = `Next run in ${etaStr}`;
+    elSpeedtestStatusText.className =
+      'px-2 py-0.5 rounded-full text-[11px] font-mono bg-emerald-950/50 text-emerald-300 border border-emerald-800/50';
+  } else {
+    elSpeedtestStatusText.textContent = `Auto every ${st.interval_min}m`;
+    elSpeedtestStatusText.className =
+      'px-2 py-0.5 rounded-full text-[11px] font-mono bg-slate-900 text-slate-300 border border-slate-800';
+  }
+}
+
+function renderSpeedtestKPIs() {
+  const latestOk = state.speedtestLatestOk;
+  const summary = state.speedtestSummary || {};
+  const st = state.speedtestStatus;
+
+  if (elStLatestDownload) {
+    elStLatestDownload.textContent =
+      latestOk && latestOk.download_mbps !== null
+        ? `${Number(latestOk.download_mbps).toFixed(1)} Mbps`
+        : '-- Mbps';
+  }
+  if (elStDownloadStats) {
+    const avgDl =
+      summary.avg_download_mbps !== null && summary.avg_download_mbps !== undefined
+        ? `${Number(summary.avg_download_mbps).toFixed(1)}`
+        : '--';
+    const minDl =
+      summary.min_download_mbps !== null && summary.min_download_mbps !== undefined
+        ? `${Number(summary.min_download_mbps).toFixed(1)}`
+        : '--';
+    elStDownloadStats.textContent = `Avg ${avgDl} Mbps · Min ${minDl} Mbps`;
+  }
+
+  if (elStLatestUpload) {
+    elStLatestUpload.textContent =
+      latestOk && latestOk.upload_mbps !== null && latestOk.upload_mbps !== undefined
+        ? `${Number(latestOk.upload_mbps).toFixed(1)} Mbps`
+        : latestOk && latestOk.mode === 'eco_download_only'
+        ? 'Skipped'
+        : '-- Mbps';
+  }
+  if (elStUploadStats) {
+    const avgUl =
+      summary.avg_upload_mbps !== null && summary.avg_upload_mbps !== undefined
+        ? `${Number(summary.avg_upload_mbps).toFixed(1)}`
+        : '--';
+    const minUl =
+      summary.min_upload_mbps !== null && summary.min_upload_mbps !== undefined
+        ? `${Number(summary.min_upload_mbps).toFixed(1)}`
+        : '--';
+    elStUploadStats.textContent = `Avg ${avgUl} Mbps · Min ${minUl} Mbps`;
+  }
+
+  if (elStLatestPing) {
+    elStLatestPing.textContent =
+      latestOk && latestOk.ping_ms !== null ? `${Number(latestOk.ping_ms).toFixed(1)} ms` : '-- ms';
+  }
+  if (elStServerInfo) {
+    const jitter =
+      latestOk && latestOk.jitter_ms !== null ? `${Number(latestOk.jitter_ms).toFixed(1)} ms` : '--';
+    const srv = latestOk && latestOk.server_location ? latestOk.server_location : 'Cloudflare Edge';
+    elStServerInfo.textContent = `Jitter ${jitter} · ${srv}`;
+  }
+
+  if (elStLatestData) {
+    elStLatestData.textContent = latestOk ? formatBytesMb(latestOk.bytes_used) : '-- MB';
+  }
+  if (elStModeSummary) {
+    const activeMode = (st && st.mode) || (latestOk && latestOk.mode) || 'eco';
+    elStModeSummary.textContent = SPEEDTEST_MODE_LABELS[activeMode] || activeMode;
+  }
+
+  if (elStWindowBytesSummary) {
+    const totalRuns = Number(summary.total_runs || 0);
+    const totalBytes = formatBytesMb(summary.total_bytes_used || 0);
+    elStWindowBytesSummary.textContent = `${totalRuns} run${totalRuns === 1 ? '' : 's'} · ${totalBytes} total`;
+  }
+}
+
+function renderSpeedtestTable() {
+  if (!elSpeedtestTableBody) return;
+  elSpeedtestTableBody.innerHTML = '';
+  const rows = state.speedtestHistory || [];
+
+  if (rows.length === 0) {
+    elSpeedtestTableBody.innerHTML = `
+      <tr>
+        <td colspan="9" class="py-10 text-center text-slate-500 font-sans text-xs">
+          No speedtest checks recorded yet. Click <span class="text-cyan-400">Run Now</span> or wait for the scheduled check.
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  for (const r of rows) {
+    const d = new Date(r.timestamp * 1000);
+    const timeStr = d.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+
+    const isOk = r.status === 'ok';
+    const dlHtml = isOk && r.download_mbps !== null
+      ? `<span class="text-cyan-300 font-semibold">${Number(r.download_mbps).toFixed(1)} Mbps</span>`
+      : `<span class="text-rose-400" title="${escapeHtml(r.error_message || 'Failed')}">Error</span>`;
+    const ulHtml = !isOk
+      ? '<span class="text-slate-600">--</span>'
+      : r.upload_mbps !== null && r.upload_mbps !== undefined
+      ? `<span class="text-purple-300 font-semibold">${Number(r.upload_mbps).toFixed(1)} Mbps</span>`
+      : '<span class="text-slate-500">Skipped</span>';
+    const pingStr = isOk && r.ping_ms !== null ? `${Number(r.ping_ms).toFixed(1)} ms` : '--';
+    const dataStr = formatBytesMb(r.bytes_used || 0);
+    const durStr = `${Number(r.duration_sec || 0).toFixed(1)}s`;
+    const modeLabel = SPEEDTEST_MODE_LABELS[r.mode] || r.mode || 'eco';
+    const serverShort = r.server_location ? ` · ${r.server_location.replace('Cloudflare ', '')}` : '';
+    const trigCls =
+      r.trigger === 'manual'
+        ? 'text-cyan-300 bg-cyan-950/60 border-cyan-800/60'
+        : 'text-slate-300 bg-slate-900 border-slate-800';
+
+    const tr = document.createElement('tr');
+    tr.className = 'hover:bg-slate-900/60 transition';
+    tr.innerHTML = `
+      <td class="py-2.5 px-4 text-slate-200">${escapeHtml(timeStr)}</td>
+      <td class="py-2.5 px-3 text-slate-500">${formatRelativeAgo(r.timestamp)}</td>
+      <td class="py-2.5 px-3 text-right">${dlHtml}</td>
+      <td class="py-2.5 px-3 text-right">${ulHtml}</td>
+      <td class="py-2.5 px-3 text-right text-emerald-300">${pingStr}</td>
+      <td class="py-2.5 px-3 text-right text-slate-300">${dataStr}</td>
+      <td class="py-2.5 px-3 text-right text-slate-400">${durStr}</td>
+      <td class="py-2.5 px-3 text-slate-400">
+        <span>${escapeHtml(modeLabel)}</span><span class="text-slate-500">${escapeHtml(serverShort)}</span>
+        ${!isOk && r.error_message ? `<div class="text-[10px] text-rose-400 truncate max-w-xs">${escapeHtml(r.error_message)}</div>` : ''}
+      </td>
+      <td class="py-2.5 px-4">
+        <span class="px-2 py-0.5 rounded border text-[11px] font-sans ${trigCls}">
+          ${escapeHtml(r.trigger || 'scheduled')}
+        </span>
+      </td>
+    `;
+    elSpeedtestTableBody.appendChild(tr);
+  }
+}
+
+function renderSpeedtestUI() {
+  updateSpeedtestNavBadge();
+  updateSpeedtestStatusBanner();
+  renderSpeedtestKPIs();
+  renderSpeedtestChart();
+  renderSpeedtestTable();
+}
+
+async function loadSpeedtestStatus() {
+  try {
+    const res = await fetch('/api/speedtest/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    state.speedtestStatus = data.status || null;
+    state.speedtestLatest = data.latest || null;
+    state.speedtestLatestOk = data.latest_ok || null;
+    updateSpeedtestNavBadge();
+    updateSpeedtestStatusBanner();
+    if (state.activeTab === 'speedtest') {
+      renderSpeedtestKPIs();
+    }
+  } catch (err) {
+    console.error('Failed loading speedtest status:', err);
+  }
+}
+
+async function loadSpeedtestHistory() {
+  if (!elSelectSpeedtestWindow) return;
+  const windowSec = Number(elSelectSpeedtestWindow.value || 86400);
+  try {
+    const res = await fetch(`/api/speedtest/history?window=${windowSec}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    state.speedtestHistory = data.results || [];
+    state.speedtestSummary = data.summary || null;
+    state.speedtestLatest = data.latest || null;
+    state.speedtestLatestOk = data.latest_ok || null;
+    if (data.status) state.speedtestStatus = data.status;
+    renderSpeedtestUI();
+  } catch (err) {
+    console.error('Failed loading speedtest history:', err);
+  }
+}
+
+async function saveSpeedtestSettings() {
+  const enabled = elToggleSpeedtestEnabled ? Boolean(elToggleSpeedtestEnabled.checked) : true;
+  const rawIv = Number(elInputSpeedtestInterval ? elInputSpeedtestInterval.value : 60);
+  const interval_min = Math.max(5, Math.min(1440, Math.round(rawIv || 60)));
+  if (elInputSpeedtestInterval) elInputSpeedtestInterval.value = String(interval_min);
+  const mode = elSelectSpeedtestMode ? elSelectSpeedtestMode.value : 'eco';
+
+  try {
+    const res = await fetch('/api/speedtest/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled, interval_min, mode }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    state.speedtestSettingsDirty = false;
+    state.speedtestStatus = data.status || null;
+    updateSpeedtestStatusBanner();
+    renderSpeedtestKPIs();
+    if (elBtnSaveSpeedtestSettings) {
+      elBtnSaveSpeedtestSettings.textContent = 'Saved';
+      setTimeout(() => {
+        if (elBtnSaveSpeedtestSettings) elBtnSaveSpeedtestSettings.textContent = 'Save';
+      }, 1200);
+    }
+  } catch (err) {
+    console.error('Failed saving speedtest settings:', err);
+  }
+}
+
+async function triggerManualSpeedtest() {
+  try {
+    const res = await fetch('/api/speedtest/run', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (data.status) {
+      state.speedtestStatus = data.status;
+      updateSpeedtestNavBadge();
+      updateSpeedtestStatusBanner();
+    } else if (res.ok && state.speedtestStatus) {
+      state.speedtestStatus.is_running = true;
+      state.speedtestStatus.active_trigger = 'manual';
+      updateSpeedtestNavBadge();
+      updateSpeedtestStatusBanner();
+    }
+  } catch (err) {
+    console.error('Failed starting manual speedtest:', err);
+  }
+}
+
+// ============================================================================
 // API & WebSocket
 // ============================================================================
 async function selectTarget(targetId) {
@@ -991,6 +1520,10 @@ async function refreshAfterReconnect() {
     await selectTarget(state.selectedTargetId);
   }
   scheduleLossLogRefresh(true);
+  loadSpeedtestStatus();
+  if (state.activeTab === 'speedtest') {
+    loadSpeedtestHistory();
+  }
 }
 
 function connectWebSocket() {
@@ -1017,6 +1550,7 @@ function connectWebSocket() {
     } else {
       state.hasConnectedOnce = true;
       refreshLossBadge();
+      loadSpeedtestStatus();
     }
   };
 
@@ -1055,6 +1589,39 @@ function handleWsMessage(msg) {
 
   if (msg.type === 'loss_update') {
     scheduleLossLogRefresh(false);
+    return;
+  }
+
+  if (msg.type === 'speedtest_status') {
+    if (msg.status) state.speedtestStatus = msg.status;
+    updateSpeedtestNavBadge();
+    updateSpeedtestStatusBanner();
+    return;
+  }
+
+  if (msg.type === 'speedtest_result') {
+    if (msg.status) state.speedtestStatus = msg.status;
+    if (msg.result) {
+      state.speedtestLatest = msg.result;
+      if (msg.result.status === 'ok') {
+        state.speedtestLatestOk = msg.result;
+      }
+    }
+    updateSpeedtestNavBadge();
+    updateSpeedtestStatusBanner();
+    if (state.activeTab === 'speedtest') {
+      loadSpeedtestHistory();
+    }
+    return;
+  }
+
+  if (msg.type === 'speedtest_cleared') {
+    state.speedtestHistory = [];
+    state.speedtestSummary = null;
+    state.speedtestLatest = null;
+    state.speedtestLatestOk = null;
+    renderSpeedtestUI();
+    loadSpeedtestStatus();
     return;
   }
 
@@ -1154,6 +1721,41 @@ function handleWsMessage(msg) {
 function bindEvents() {
   elTabBtnLive.addEventListener('click', () => switchTab('live'));
   elTabBtnLossLog.addEventListener('click', () => switchTab('losslog'));
+  if (elTabBtnSpeedtest) {
+    elTabBtnSpeedtest.addEventListener('click', () => switchTab('speedtest'));
+  }
+
+  if (elToggleSpeedtestEnabled) {
+    elToggleSpeedtestEnabled.addEventListener('change', () => {
+      state.speedtestSettingsDirty = true;
+    });
+  }
+  if (elInputSpeedtestInterval) {
+    elInputSpeedtestInterval.addEventListener('input', () => {
+      state.speedtestSettingsDirty = true;
+    });
+  }
+  if (elSelectSpeedtestMode) {
+    elSelectSpeedtestMode.addEventListener('change', () => {
+      state.speedtestSettingsDirty = true;
+    });
+  }
+  if (elBtnSaveSpeedtestSettings) {
+    elBtnSaveSpeedtestSettings.addEventListener('click', saveSpeedtestSettings);
+  }
+  if (elBtnRunSpeedtestNow) {
+    elBtnRunSpeedtestNow.addEventListener('click', triggerManualSpeedtest);
+  }
+  if (elSelectSpeedtestWindow) {
+    elSelectSpeedtestWindow.addEventListener('change', loadSpeedtestHistory);
+  }
+  if (elBtnClearSpeedtestHistory) {
+    elBtnClearSpeedtestHistory.addEventListener('click', async () => {
+      if (!confirm('Clear all recorded speedtest history?')) return;
+      await fetch('/api/speedtest/history', { method: 'DELETE' });
+      await loadSpeedtestHistory();
+    });
+  }
 
   elSelectLossTargetFilter.addEventListener('change', loadLossLog);
   elSelectLossWindowFilter.addEventListener('change', loadLossLog);
@@ -1285,4 +1887,11 @@ window.addEventListener('DOMContentLoaded', () => {
   initTimelineChart();
   bindEvents();
   connectWebSocket();
+  loadSpeedtestStatus();
+  if (state.speedtestStatusTimer) clearInterval(state.speedtestStatusTimer);
+  state.speedtestStatusTimer = setInterval(() => {
+    if (state.activeTab === 'speedtest' && state.speedtestStatus) {
+      updateSpeedtestStatusBanner();
+    }
+  }, 30000);
 });

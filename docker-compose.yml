@@ -15,6 +15,9 @@ services:
       - PROBE_INTERVAL=1.0
       - RETENTION_HOURS=48
       - LOSS_RETENTION_DAYS=365
+      - SPEEDTEST_ENABLED=1
+      - SPEEDTEST_INTERVAL_MIN=60
+      - SPEEDTEST_MODE=eco
     cap_add:
       - NET_RAW
       - NET_ADMIN
