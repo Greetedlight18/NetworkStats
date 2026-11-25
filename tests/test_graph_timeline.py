@@ -301,7 +301,7 @@ class GraphTimelineTests(unittest.TestCase):
 
         with open("app/static/index.html") as f:
             index_html = f.read()
-        self.assertIn('/static/app.js?v=1.4.0', index_html)
+        self.assertIn('/static/app.js?v=1.4.1', index_html)
 
         with open("app/main.py") as f:
             main_py = f.read()

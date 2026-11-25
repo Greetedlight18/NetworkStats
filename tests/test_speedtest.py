@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -104,15 +105,25 @@ class _FakeClock:
 
 
 class _FakeResponse:
-    def __init__(self, clock: _FakeClock, headers: dict, body_bytes: int, bps: float) -> None:
+    def __init__(
+        self,
+        clock: _FakeClock,
+        headers: list,
+        status: int = 200,
+        body_bytes: bytes = b"",
+        stream_size: int = 0,
+        bps: float = 1e9,
+    ) -> None:
         self._clock = clock
-        self._headers = dict(headers)
-        self._remaining = int(body_bytes)
+        self._headers = list(headers)
+        self.status = status
+        self._body = body_bytes
+        self._offset = 0
+        self._remaining = stream_size if stream_size > 0 else len(body_bytes)
         self._bps = float(bps)
-        self.status = 200
 
     def getheaders(self):
-        return list(self._headers.items())
+        return list(self._headers)
 
     def read(self, amt: int = -1) -> bytes:
         if self._remaining <= 0:
@@ -123,6 +134,13 @@ class _FakeResponse:
             to_read = min(self._remaining, amt)
         self._remaining -= to_read
         self._clock.advance(to_read / self._bps)
+        if to_read >= 65536:
+            # Yield GIL slightly so parallel worker threads interleave like real sockets
+            time.sleep(0.0001)
+        if self._body:
+            out = self._body[self._offset : self._offset + to_read]
+            self._offset += to_read
+            return out
         return b"\x00" * to_read
 
 
@@ -130,76 +148,141 @@ class _RecordingScenario:
     def __init__(
         self,
         clock: _FakeClock,
-        dl_bps: float = 12_500_000.0,  # 100 Mbps
-        ul_bps: float = 2_500_000.0,   # 20 Mbps
-        rtt_sec: float = 0.02,         # 20 ms
+        dl_bps: float = 112_500_000.0,  # 900 Mbps aggregate
+        ul_bps: float = 6_250_000.0,    # 50 Mbps aggregate
+        rtt_sec: float = 0.015,         # 15 ms network RTT
+        cf_server_ms: float = 150.0,    # Extra Cloudflare Worker processing latency
+        fastcom_fail: bool = False,
+        cf_fail: bool = False,
     ) -> None:
         self.clock = clock
         self.dl_bps = dl_bps
         self.ul_bps = ul_bps
         self.rtt_sec = rtt_sec
+        self.cf_server_ms = cf_server_ms
+        self.fastcom_fail = fastcom_fail
+        self.cf_fail = cf_fail
         self.requests = []
-        self.conn_count = 0
+        self.conns_by_host = {}
         self.lock = threading.Lock()
 
-    def make_connection(self, timeout: float = 8.0):
+    def make_connection(self, host: str = st_mod.CLOUDFLARE_HOST, timeout: float = 8.0):
         with self.lock:
-            self.conn_count += 1
-        return _FakeHTTPSConnection(self)
+            self.conns_by_host[host] = self.conns_by_host.get(host, 0) + 1
+        return _FakeHTTPSConnection(self, host)
 
 
 class _FakeHTTPSConnection:
-    def __init__(self, scenario: _RecordingScenario) -> None:
+    def __init__(self, scenario: _RecordingScenario, host: str) -> None:
         self._s = scenario
+        self._host = host
         self._pending_resp = None
-        self._upload_target = 0
-        self._upload_sent = 0
-        self._closed = False
 
     def request(self, method: str, path: str, headers=None) -> None:
+        hdrs_dict = dict(headers or {})
         with self._s.lock:
-            self._s.requests.append((method, path))
-        self._s.clock.advance(self._s.rtt_sec)
+            self._s.requests.append((self._host, method, path, hdrs_dict))
+
+        if self._host == st_mod.FASTCOM_HOST:
+            if self._s.fastcom_fail:
+                raise OSError("Fast.com unreachable")
+            if path.startswith("/app-"):
+                js = b'var x={token:"fastcom_mock_token_123456"};'
+                self._pending_resp = _FakeResponse(self._s.clock, [], body_bytes=js)
+            else:
+                html = b'<html><script src="/app-mock01.js"></script></html>'
+                self._pending_resp = _FakeResponse(self._s.clock, [], body_bytes=html)
+            return
+
+        if self._host == st_mod.FASTCOM_API_HOST:
+            if self._s.fastcom_fail:
+                self._pending_resp = _FakeResponse(self._s.clock, [], status=503)
+                return
+            payload = {
+                "client": {"ip": "74.56.22.210", "asn": "5769", "isp": "Videotron"},
+                "targets": [
+                    {
+                        "location": {"city": "MONTRÉAL", "country": "CA"},
+                        "url": f"https://c01.oca.nflxvideo.net/speedtest?c=ca&n=5769",
+                    },
+                    {
+                        "location": {"city": "MONTRÉAL", "country": "CA"},
+                        "url": f"https://c02.oca.nflxvideo.net/speedtest?c=ca&n=5769",
+                    },
+                    {
+                        "location": {"city": "Saint-Hubert", "country": "CA"},
+                        "url": f"https://c03.oca.nflxvideo.net/speedtest?c=ca&n=5769",
+                    },
+                ],
+            }
+            # Mirror real Fast.com API Latin-1 city encoding
+            raw = json.dumps(payload, ensure_ascii=False).encode("latin-1")
+            self._pending_resp = _FakeResponse(self._s.clock, [], body_bytes=raw)
+            return
+
+        if self._host.endswith(".oca.nflxvideo.net"):
+            if self._s.fastcom_fail:
+                self._pending_resp = _FakeResponse(self._s.clock, [], status=403)
+                return
+            self._s.clock.advance(self._s.rtt_sec)
+            if "/speedtest/range/0-0" in path:
+                self._pending_resp = _FakeResponse(
+                    self._s.clock, [], body_bytes=b"\x00", bps=self._s.dl_bps
+                )
+            else:
+                parts = path.split("/speedtest/range/")[1].split("?")[0].split("-")
+                nbytes = int(parts[1]) - int(parts[0])
+                self._pending_resp = _FakeResponse(
+                    self._s.clock, [], stream_size=nbytes, bps=self._s.dl_bps
+                )
+            return
+
+        # Cloudflare host
+        if self._s.cf_fail:
+            self._pending_resp = _FakeResponse(self._s.clock, [], status=403)
+            return
+        self._s.clock.advance(self._s.rtt_sec + (self._s.cf_server_ms / 1000.0))
         nbytes = 0
         if "bytes=" in path:
             nbytes = int(path.split("bytes=")[1].split("&")[0])
-        resp_headers = {
-            "cf-meta-colo": "YUL",
-            "city": "Montr%C3%A9al",
-        }
+        resp_hdrs = [
+            ("cf-meta-colo", "YUL"),
+            ("city", "Longueuil"),
+            ("Server-Timing", f"cfSpeedEdge;dur=3, cfSpeedWorker;dur={self._s.cf_server_ms - 3}"),
+        ]
         self._pending_resp = _FakeResponse(
-            self._s.clock, resp_headers, body_bytes=nbytes, bps=self._s.dl_bps
+            self._s.clock, resp_hdrs, stream_size=nbytes, bps=self._s.dl_bps
         )
 
     def putrequest(self, method: str, path: str) -> None:
-        with self._s.lock:
-            self._s.requests.append((method, path))
-        self._upload_target = 0
-        self._upload_sent = 0
+        self._cur_upload_method = method
+        self._cur_upload_path = path
+        self._cur_upload_hdrs = {}
 
     def putheader(self, name: str, value: str) -> None:
-        if name.lower() == "content-length":
-            self._upload_target = int(value)
+        self._cur_upload_hdrs[name] = value
 
     def endheaders(self) -> None:
-        pass
+        with self._s.lock:
+            self._s.requests.append(
+                (self._host, self._cur_upload_method, self._cur_upload_path, dict(self._cur_upload_hdrs))
+            )
 
     def send(self, data: bytes) -> None:
-        n = len(data)
-        self._upload_sent += n
-        self._s.clock.advance(n / self._s.ul_bps)
+        self._s.clock.advance(len(data) / self._s.ul_bps)
 
     def getresponse(self) -> _FakeResponse:
         if self._pending_resp is not None:
             resp = self._pending_resp
             self._pending_resp = None
             return resp
-        # Upload ACK response
+        if self._host == st_mod.CLOUDFLARE_HOST and self._s.cf_fail:
+            return _FakeResponse(self._s.clock, [], status=403)
         self._s.clock.advance(self._s.rtt_sec)
-        return _FakeResponse(self._s.clock, {"cf-meta-colo": "YUL"}, body_bytes=0, bps=1e9)
+        return _FakeResponse(self._s.clock, [("cf-meta-colo", "YUL")], body_bytes=b"")
 
     def close(self) -> None:
-        self._closed = True
+        pass
 
 
 class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
@@ -209,6 +292,9 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = os.path.join(self._tmpdir.name, "test_speedtest.db")
         database.close_thread_connections()
         database.init_db()
+        with st_mod._FASTCOM_TOKEN_LOCK:
+            st_mod._FASTCOM_TOKEN_CACHE["token"] = None
+            st_mod._FASTCOM_TOKEN_CACHE["expires_at"] = 0.0
 
     async def asyncTearDown(self) -> None:
         database.close_thread_connections()
@@ -227,9 +313,7 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(updated["enabled"])
         self.assertEqual(updated["interval_min"], 15)
         self.assertEqual(updated["mode"], "eco_download_only")
-
-        reloaded = database.get_speedtest_settings()
-        self.assertEqual(reloaded, updated)
+        self.assertEqual(database.get_speedtest_settings(), updated)
 
         with self.assertRaises(ValueError):
             database.update_speedtest_settings(interval_min=4)
@@ -240,7 +324,6 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
 
     def test_speedtest_history_summary_window_clear_and_prune(self) -> None:
         now = int(time.time())
-        # Old record (400 days ago -> should be excluded from 24h window AND pruned)
         database.save_speedtest_result(
             {
                 "timestamp": now - (400 * 86400),
@@ -251,23 +334,22 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
                 "bytes_used": 10_000_000,
                 "duration_sec": 3.0,
                 "mode": "eco",
-                "server_location": "Cloudflare Montréal (YUL)",
+                "server_location": "Fast.com Montréal (Videotron)",
                 "trigger": "scheduled",
                 "status": "ok",
             }
         )
-        # Recent ok records
         database.save_speedtest_result(
             {
                 "timestamp": now - 1200,
-                "download_mbps": 100.0,
-                "upload_mbps": 20.0,
-                "ping_ms": 18.0,
-                "jitter_ms": 1.5,
-                "bytes_used": 20_000_000,
-                "duration_sec": 3.2,
+                "download_mbps": 800.0,
+                "upload_mbps": 40.0,
+                "ping_ms": 14.0,
+                "jitter_ms": 1.2,
+                "bytes_used": 120_000_000,
+                "duration_sec": 2.4,
                 "mode": "eco",
-                "server_location": "Cloudflare Montréal (YUL)",
+                "server_location": "Fast.com Montréal (Videotron)",
                 "trigger": "scheduled",
                 "status": "ok",
             }
@@ -275,19 +357,18 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
         database.save_speedtest_result(
             {
                 "timestamp": now - 600,
-                "download_mbps": 200.0,
-                "upload_mbps": 40.0,
+                "download_mbps": 900.0,
+                "upload_mbps": 50.0,
                 "ping_ms": 12.0,
                 "jitter_ms": 0.8,
-                "bytes_used": 30_000_000,
+                "bytes_used": 150_000_000,
                 "duration_sec": 2.9,
                 "mode": "balanced",
-                "server_location": "Cloudflare Montréal (YUL)",
+                "server_location": "Fast.com Montréal (Videotron)",
                 "trigger": "manual",
                 "status": "ok",
             }
         )
-        # Recent error record (should not skew speed averages, latest != latest_ok)
         database.save_speedtest_result(
             {
                 "timestamp": now - 60,
@@ -310,106 +391,141 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["total_runs"], 3)
         self.assertEqual(summary["successful_runs"], 2)
         self.assertEqual(summary["failed_runs"], 1)
-        self.assertEqual(summary["avg_download_mbps"], 150.0)
-        self.assertEqual(summary["min_download_mbps"], 100.0)
-        self.assertEqual(summary["max_download_mbps"], 200.0)
-        self.assertEqual(summary["avg_upload_mbps"], 30.0)
-        self.assertEqual(summary["avg_ping_ms"], 15.0)
-        self.assertEqual(summary["total_bytes_used"], 50_500_000)
+        self.assertEqual(summary["avg_download_mbps"], 850.0)
+        self.assertEqual(summary["min_download_mbps"], 800.0)
+        self.assertEqual(summary["max_download_mbps"], 900.0)
+        self.assertEqual(summary["avg_upload_mbps"], 45.0)
+        self.assertEqual(summary["avg_ping_ms"], 13.0)
+        self.assertEqual(summary["total_bytes_used"], 270_500_000)
 
         self.assertEqual(hist_24h["latest"]["status"], "error")
-        self.assertEqual(hist_24h["latest_ok"]["download_mbps"], 200.0)
+        self.assertEqual(hist_24h["latest_ok"]["download_mbps"], 900.0)
 
-        # Prune should delete the 400-day-old row while keeping recent 3 rows
         database.prune_old_metrics()
-        hist_all = database.get_speedtest_history(window_seconds=0)
-        self.assertEqual(len(hist_all["results"]), 3)
+        self.assertEqual(len(database.get_speedtest_history(window_seconds=0)["results"]), 3)
 
-        removed = database.clear_speedtest_results()
-        self.assertEqual(removed, 3)
+        self.assertEqual(database.clear_speedtest_results(), 3)
         self.assertIsNone(database.get_latest_speedtest_ts())
 
-    def test_eco_mode_low_bandwidth_and_location(self) -> None:
+    def test_compute_steady_mbps_trims_warmup_and_outlier_dips(self) -> None:
+        # 200ms buckets across 2.0s: 22.5 MB/bucket == 900 Mbps
+        bucket_rates_mbps = [80.0, 220.0, 900.0, 900.0, 900.0, 140.0, 900.0, 900.0, 900.0, 1080.0]
+        events = [(0.0, 0)]
+        for i, mbps in enumerate(bucket_rates_mbps):
+            chunk_bytes = int((mbps * 1_000_000.0 / 8.0) * 0.2)
+            events.append(((i * 0.2) + 0.05, chunk_bytes // 2))
+            events.append(((i * 0.2) + 0.15, chunk_bytes - (chunk_bytes // 2)))
+        # Incomplete trailing bucket (0.04s after t=2.0 -> ignored)
+        events.append((2.04, 100_000))
+
+        steady = st_mod._compute_steady_mbps(events, fallback_sec=2.04)
+        self.assertGreaterEqual(steady, 860.0)
+        self.assertLessEqual(steady, 940.0)
+
+    def test_parse_cf_server_timing_ms(self) -> None:
+        hdrs = [
+            ("Server-Timing", "cfSpeedEdge;dur=3, cfSpeedWorker;dur=206"),
+            ("server-timing", 'cfL4;desc="?proto=TCP&rtt=17360&min_rtt=16402"'),
+        ]
+        server_ms, l4_ms = st_mod._parse_cf_server_timing_ms(hdrs)
+        self.assertAlmostEqual(server_ms, 209.0, places=2)
+        self.assertAlmostEqual(l4_ms, 17.36, places=2)
+
+    def test_fastcom_eco_gigabit_and_location_latin1(self) -> None:
         clock = _FakeClock()
-        scenario = _RecordingScenario(clock, dl_bps=12_500_000.0, ul_bps=2_500_000.0, rtt_sec=0.02)
+        scenario = _RecordingScenario(clock, dl_bps=112_500_000.0, ul_bps=6_250_000.0, rtt_sec=0.015)
 
         with patch.object(st_mod, "_make_connection", side_effect=scenario.make_connection), patch.object(
             st_mod, "time", clock
         ):
-            res = st_mod.run_cloudflare_speedtest(mode="eco", trigger="scheduled", cooldown_sec=0.0)
+            res = st_mod.run_fastcom_speedtest(mode="eco", trigger="scheduled", cooldown_sec=0.0)
 
         self.assertEqual(res["status"], "ok")
-        self.assertEqual(res["mode"], "eco")
-        self.assertEqual(res["server_location"], "Cloudflare Montréal (YUL)")
-        self.assertAlmostEqual(res["ping_ms"], 20.0, delta=0.5)
-        self.assertAlmostEqual(res["download_mbps"], 100.0, delta=5.0)
-        self.assertAlmostEqual(res["upload_mbps"], 20.0, delta=2.0)
-        # 1 MB cal + <=25 MB DL + 256 KB cal + <=10 MB UL
-        self.assertLessEqual(res["bytes_used"], 36_500_000)
-        self.assertEqual(scenario.conn_count, 2)  # 1 seq DL + 1 seq UL
+        self.assertEqual(res["server_location"], "Fast.com Montréal (Videotron)")
+        self.assertAlmostEqual(res["ping_ms"], 15.0, delta=1.0)
+        self.assertAlmostEqual(res["download_mbps"], 900.0, delta=60.0)
+        self.assertAlmostEqual(res["upload_mbps"], 50.0, delta=5.0)
+        # Verify 2 download streams targeted Fast.com Open Connect hosts
+        dl_hosts = {
+            h for (h, m, p, _) in scenario.requests if h.endswith(".oca.nflxvideo.net") and "/range/0-26214400" in p
+        }
+        self.assertEqual(len(dl_hosts), 2)
 
-    def test_eco_download_only_skips_upload(self) -> None:
+    def test_fastcom_eco_download_only_skips_upload(self) -> None:
         clock = _FakeClock()
-        scenario = _RecordingScenario(clock, dl_bps=6_250_000.0, ul_bps=1_250_000.0, rtt_sec=0.015)
+        scenario = _RecordingScenario(clock, dl_bps=100_000_000.0, ul_bps=5_000_000.0, rtt_sec=0.012)
 
         with patch.object(st_mod, "_make_connection", side_effect=scenario.make_connection), patch.object(
             st_mod, "time", clock
         ):
-            res = st_mod.run_cloudflare_speedtest(
+            res = st_mod.run_fastcom_speedtest(
                 mode="eco_download_only", trigger="manual", cooldown_sec=0.0
             )
 
         self.assertEqual(res["status"], "ok")
         self.assertIsNone(res["upload_mbps"])
-        self.assertAlmostEqual(res["download_mbps"], 50.0, delta=3.0)
-        upload_reqs = [req for req in scenario.requests if req[0] == "POST"]
-        self.assertEqual(upload_reqs, [])
+        self.assertGreater(res["download_mbps"], 700.0)
+        self.assertEqual([r for r in scenario.requests if r[1] == "POST"], [])
 
-    def test_slow_line_short_circuits_after_calibration(self) -> None:
+    def test_fastcom_balanced_uses_four_dl_and_two_ul_streams(self) -> None:
         clock = _FakeClock()
-        # 4 Mbps = 500,000 bytes/sec -> 1 MB calibration takes 2.0s (>= 1.5s threshold)
-        scenario = _RecordingScenario(clock, dl_bps=500_000.0, ul_bps=250_000.0, rtt_sec=0.03)
+        scenario = _RecordingScenario(clock, dl_bps=125_000_000.0, ul_bps=12_500_000.0, rtt_sec=0.01)
 
         with patch.object(st_mod, "_make_connection", side_effect=scenario.make_connection), patch.object(
             st_mod, "time", clock
         ):
-            res = st_mod.run_cloudflare_speedtest(
-                mode="eco_download_only", trigger="scheduled", cooldown_sec=0.0
-            )
-
-        self.assertEqual(res["status"], "ok")
-        bulk_dl_reqs = [
-            req for req in scenario.requests if req[0] == "GET" and "bytes=0" not in req[1]
-        ]
-        self.assertEqual(len(bulk_dl_reqs), 1)  # skipped second download burst
-        self.assertAlmostEqual(res["download_mbps"], 4.0, delta=0.5)
-
-    def test_balanced_mode_runs_two_streams(self) -> None:
-        clock = _FakeClock()
-        scenario = _RecordingScenario(clock, dl_bps=25_000_000.0, ul_bps=12_500_000.0, rtt_sec=0.01)
-
-        with patch.object(st_mod, "_make_connection", side_effect=scenario.make_connection), patch.object(
-            st_mod, "time", clock
-        ):
-            res = st_mod.run_cloudflare_speedtest(
-                mode="balanced", trigger="manual", cooldown_sec=0.0
-            )
+            res = st_mod.run_fastcom_speedtest(mode="balanced", trigger="manual", cooldown_sec=0.0)
 
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["mode"], "balanced")
-        self.assertGreater(res["download_mbps"], 50.0)
-        self.assertGreater(res["upload_mbps"], 20.0)
-        # Initial DL conn + 2 parallel DL + initial UL conn + 2 parallel UL = 6 connections
-        self.assertEqual(scenario.conn_count, 6)
+        self.assertGreater(res["download_mbps"], 800.0)
+        self.assertGreater(res["upload_mbps"], 80.0)
+        cdn_conns = sum(v for k, v in scenario.conns_by_host.items() if k.endswith(".oca.nflxvideo.net"))
+        # 1 ping + 4 dl + 1 ul cal + 2 parallel ul = 8
+        self.assertGreaterEqual(cdn_conns, 8)
 
-    def test_network_error_returns_clean_error_dict(self) -> None:
-        with patch.object(st_mod, "_make_connection", side_effect=OSError("DNS lookup failed")):
+    def test_cloudflare_fallback_headers_and_server_timing_rtt(self) -> None:
+        clock = _FakeClock()
+        scenario = _RecordingScenario(
+            clock, dl_bps=100_000_000.0, ul_bps=5_000_000.0, rtt_sec=0.016, cf_server_ms=150.0
+        )
+
+        with patch.object(st_mod, "_make_connection", side_effect=scenario.make_connection), patch.object(
+            st_mod, "time", clock
+        ):
             res = st_mod.run_cloudflare_speedtest(mode="eco", trigger="scheduled", cooldown_sec=0.0)
 
-        self.assertEqual(res["status"], "error")
-        self.assertIn("DNS lookup failed", res["error_message"])
-        self.assertIsNone(res["download_mbps"])
-        self.assertIsNone(res["upload_mbps"])
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["server_location"], "Cloudflare Longueuil (YUL)")
+        # 150ms Cloudflare Worker processing subtracted -> ping stays near true 16ms RTT
+        self.assertLess(res["ping_ms"], 30.0)
+        self.assertGreater(res["download_mbps"], 700.0)
+        self.assertAlmostEqual(res["upload_mbps"], 40.0, delta=5.0)
+        cf_reqs = [r for r in scenario.requests if r[0] == st_mod.CLOUDFLARE_HOST]
+        self.assertTrue(any("measId=" in p for (_, _, p, _) in cf_reqs))
+        self.assertTrue(all(h.get("Referer") == "https://speed.cloudflare.com/" for (_, _, _, h) in cf_reqs))
+
+    def test_run_speedtest_falls_back_to_cloudflare_and_handles_both_failing(self) -> None:
+        clock = _FakeClock()
+        scenario = _RecordingScenario(clock, fastcom_fail=True, cf_fail=False)
+
+        with patch.object(st_mod, "_make_connection", side_effect=scenario.make_connection), patch.object(
+            st_mod, "time", clock
+        ):
+            res = st_mod.run_speedtest(mode="eco", trigger="scheduled", cooldown_sec=0.0)
+
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("Cloudflare", res["server_location"])
+
+        both_fail = _RecordingScenario(clock, fastcom_fail=True, cf_fail=True)
+        with patch.object(st_mod, "_make_connection", side_effect=both_fail.make_connection), patch.object(
+            st_mod, "time", clock
+        ):
+            err_res = st_mod.run_speedtest(mode="eco", trigger="scheduled", cooldown_sec=0.0)
+
+        self.assertEqual(err_res["status"], "error")
+        self.assertIn("Fast.com:", err_res["error_message"])
+        self.assertIn("Cloudflare:", err_res["error_message"])
 
     async def test_scheduler_concurrent_manual_guard_and_ws_events(self) -> None:
         events = []
@@ -423,21 +539,21 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
             gate.wait(timeout=2.0)
             return {
                 "timestamp": int(time.time()),
-                "download_mbps": 321.5,
-                "upload_mbps": 45.2,
-                "ping_ms": 14.1,
-                "jitter_ms": 1.2,
-                "bytes_used": 22_000_000,
-                "duration_sec": 2.4,
+                "download_mbps": 895.4,
+                "upload_mbps": 51.2,
+                "ping_ms": 13.8,
+                "jitter_ms": 1.1,
+                "bytes_used": 95_000_000,
+                "duration_sec": 2.1,
                 "mode": mode,
-                "server_location": "Cloudflare Montréal (YUL)",
+                "server_location": "Fast.com Montréal (Videotron)",
                 "trigger": trigger,
                 "status": "ok",
                 "error_message": None,
             }
 
         scheduler = st_mod.SpeedtestScheduler(broadcast_cb=_collect_ws, startup_grace_sec=3600)
-        with patch.object(st_mod, "run_cloudflare_speedtest", side_effect=_blocking_speedtest):
+        with patch.object(st_mod, "run_speedtest", side_effect=_blocking_speedtest):
             await scheduler.start()
             try:
                 started_1 = scheduler.trigger_manual_run()
@@ -457,7 +573,7 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("speedtest_result", event_types)
 
         res_evt = next(e for e in events if e["type"] == "speedtest_result")
-        self.assertEqual(res_evt["result"]["download_mbps"], 321.5)
+        self.assertEqual(res_evt["result"]["download_mbps"], 895.4)
         self.assertFalse(res_evt["status"]["is_running"])
 
         hist = database.get_speedtest_history(window_seconds=0)
@@ -469,14 +585,14 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
         database.save_speedtest_result(
             {
                 "timestamp": recent_ts,
-                "download_mbps": 150.0,
-                "upload_mbps": 30.0,
-                "ping_ms": 15.0,
+                "download_mbps": 880.0,
+                "upload_mbps": 49.0,
+                "ping_ms": 14.0,
                 "jitter_ms": 1.0,
-                "bytes_used": 18_000_000,
-                "duration_sec": 2.5,
+                "bytes_used": 90_000_000,
+                "duration_sec": 2.0,
                 "mode": "eco",
-                "server_location": "Cloudflare Montréal (YUL)",
+                "server_location": "Fast.com Montréal (Videotron)",
                 "trigger": "scheduled",
                 "status": "ok",
             }
@@ -489,7 +605,7 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError("Should not run on boot when recent run is inside interval")
 
         scheduler = st_mod.SpeedtestScheduler(startup_grace_sec=0)
-        with patch.object(st_mod, "run_cloudflare_speedtest", side_effect=_unexpected_run):
+        with patch.object(st_mod, "run_speedtest", side_effect=_unexpected_run):
             await scheduler.start()
             try:
                 await asyncio.sleep(0.08)
@@ -525,21 +641,21 @@ class SpeedtestTests(unittest.IsolatedAsyncioTestCase):
         database.save_speedtest_result(
             {
                 "timestamp": int(time.time()),
-                "download_mbps": 250.0,
+                "download_mbps": 910.0,
                 "upload_mbps": None,
                 "ping_ms": 14.0,
                 "jitter_ms": 1.0,
-                "bytes_used": 14_000_000,
+                "bytes_used": 85_000_000,
                 "duration_sec": 1.8,
                 "mode": "eco_download_only",
-                "server_location": "Cloudflare Montréal (YUL)",
+                "server_location": "Fast.com Montréal (Videotron)",
                 "trigger": "manual",
                 "status": "ok",
             }
         )
         hist_resp = await main_mod.api_speedtest_history(window=86400, limit=100)
         self.assertEqual(len(hist_resp["results"]), 1)
-        self.assertEqual(hist_resp["latest_ok"]["download_mbps"], 250.0)
+        self.assertEqual(hist_resp["latest_ok"]["download_mbps"], 910.0)
 
         clear_resp = await main_mod.api_clear_speedtest_history()
         self.assertTrue(clear_resp["cleared"])

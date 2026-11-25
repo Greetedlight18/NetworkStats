@@ -1132,6 +1132,7 @@ function renderSpeedtestChart() {
       pointRadius: okRows.length <= 40 ? 3.5 : 2,
       pointHoverRadius: 5,
       tension: 0.25,
+      yAxisID: 'ySpeed',
     },
     {
       label: 'Upload',
@@ -1144,6 +1145,7 @@ function renderSpeedtestChart() {
       pointHoverRadius: 5,
       spanGaps: true,
       tension: 0.25,
+      yAxisID: 'ySpeed',
     },
   ];
   state.speedtestChart.update('none');

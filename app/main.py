@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NetworkStats",
     description="Self-Hosted 24/7 Network Monitoring and Visual Traceroute Web Application",
-    version="1.4.0",
+    version="1.4.1",
     lifespan=lifespan,
 )
 
